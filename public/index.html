@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>S.R.C · A.D.D</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">A.D.D</span>
+        <div>
+          <h1>Sistema de Relocação Contínua</h1>
+          <p>Algoritmo Determinação Dependência</p>
+        </div>
+      </div>
+      <span id="serverStatus" class="status-pill">conectando</span>
+    </header>
+
+    <main>
+      <section class="scan-band" aria-label="Configuração de varredura">
+        <label class="field field-grow">
+          <span>Diretório raiz</span>
+          <input id="rootPath" type="text" spellcheck="false" placeholder="C:\Users\seu-usuario\projeto">
+        </label>
+        <label class="field">
+          <span>Máximo de arquivos</span>
+          <input id="maxFiles" type="number" min="100" max="50000" step="100" value="5000">
+        </label>
+        <label class="field">
+          <span>Profundidade</span>
+          <input id="maxDepth" type="number" min="1" max="64" step="1" value="18">
+        </label>
+        <label class="field">
+          <span>Leitura por arquivo</span>
+          <select id="maxFileSize">
+            <option value="131072">128 KB</option>
+            <option value="524288" selected>512 KB</option>
+            <option value="1048576">1 MB</option>
+            <option value="5242880">5 MB</option>
+          </select>
+        </label>
+        <button id="scanButton" class="primary-button" type="button" title="Executar varredura do A.D.D">
+          <span aria-hidden="true">▶</span>
+          Escanear
+        </button>
+        <button id="exportButton" class="secondary-button" type="button" disabled title="Exportar relatório JSON">
+          <span aria-hidden="true">⇩</span>
+          JSON
+        </button>
+      </section>
+
+      <section id="metrics" class="metrics" aria-label="Resumo do relatório"></section>
+
+      <nav class="tabs" aria-label="Visões do A.D.D">
+        <button class="tab is-active" data-tab="graph" type="button">Grafo</button>
+        <button class="tab" data-tab="files" type="button">Arquivos</button>
+        <button class="tab" data-tab="simulation" type="button">Simulação</button>
+        <button class="tab" data-tab="dependencies" type="button">Dependências</button>
+        <button class="tab" data-tab="warnings" type="button">Avisos</button>
+      </nav>
+
+      <section id="tab-graph" class="tab-panel is-active">
+        <div class="graph-layout">
+          <div class="graph-shell">
+            <div class="panel-heading">
+              <div>
+                <h2>Grafo de dependências</h2>
+                <p id="graphHint">Execute uma varredura para renderizar os nós.</p>
+              </div>
+              <select id="graphFilter" title="Filtrar nós do grafo">
+                <option value="all">Todos</option>
+                <option value="alto">Risco alto</option>
+                <option value="medio">Risco médio</option>
+                <option value="baixo">Risco baixo</option>
+              </select>
+            </div>
+            <canvas id="graphCanvas" width="1100" height="620" aria-label="Canvas do grafo"></canvas>
+            <div class="legend" aria-label="Legenda">
+              <span><b class="dot dot-protected"></b>crítico/protegido</span>
+              <span><b class="dot dot-provider"></b>provedor</span>
+              <span><b class="dot dot-mixed"></b>dependente/provedor</span>
+              <span><b class="dot dot-dependent"></b>dependente</span>
+              <span><b class="dot dot-isolated"></b>isolado</span>
+            </div>
+          </div>
+          <aside id="nodeDetails" class="details-panel">
+            <h2>Nó selecionado</h2>
+            <p class="muted">Clique em um nó do grafo ou em uma linha da tabela.</p>
+          </aside>
+        </div>
+      </section>
+
+      <section id="tab-files" class="tab-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Arquivos classificados</h2>
+            <p>Classificação primária, grau de dependência e risco calculado.</p>
+          </div>
+          <input id="fileSearch" class="search-input" type="search" placeholder="Filtrar por caminho">
+        </div>
+        <div id="filesTable" class="table-wrap"></div>
+      </section>
+
+      <section id="tab-simulation" class="tab-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Simulação de separação</h2>
+            <p>Como o A.D.D prepara material para o A.R.E sem tocar nos arquivos.</p>
+          </div>
+        </div>
+        <div id="simulationGrid" class="bucket-grid"></div>
+      </section>
+
+      <section id="tab-dependencies" class="tab-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Dependências detectadas</h2>
+            <p>Arestas locais resolvidas por import, include, asset, módulo ou pacote.</p>
+          </div>
+        </div>
+        <div id="dependenciesTable" class="table-wrap"></div>
+      </section>
+
+      <section id="tab-warnings" class="tab-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Avisos e diretórios ignorados</h2>
+            <p>Itens pulados por limite, segurança, permissão ou diretórios gerados.</p>
+          </div>
+        </div>
+        <div id="warningsList" class="warning-list"></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "name": "sistema-relocacao-continua",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MVP do Sistema de Relocacao Continua com foco no Algoritmo Determinacao Dependencia.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
