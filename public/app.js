@@ -2,7 +2,13 @@ const state = {
   result: null,
   activeTab: "graph",
   graphLayout: new Map(),
-  selectedNodeId: null
+  currentGraphNodes: [],
+  currentGraphEdges: [],
+  selectedNodeId: null,
+  hoveredNodeId: null,
+  expandedGroups: new Set(),
+  zoom: 1,
+  graphMode: "medium"
 };
 
 const labels = {
@@ -14,13 +20,10 @@ const labels = {
   diretorio: "diretório"
 };
 
-const classColors = {
-  isolado: "#3f8b5d",
-  dependente: "#26788d",
-  provedor: "#c0792b",
-  dependente_provedor: "#75569f",
-  critico_protegido: "#9d3434",
-  diretorio: "#7a7f83"
+const riskColors = {
+  baixo: "#2f8f57",
+  medio: "#d7a02c",
+  alto: "#c84444"
 };
 
 const riskWeight = {
@@ -29,9 +32,37 @@ const riskWeight = {
   baixo: 1
 };
 
+const graphModes = {
+  far: {
+    key: "far",
+    label: "mapa",
+    view: "far",
+    limit: 220,
+    nodeScale: 1.45,
+    labels: true
+  },
+  medium: {
+    key: "medium",
+    label: "grupos",
+    view: "medium",
+    limit: 360,
+    nodeScale: 1.12,
+    labels: true
+  },
+  close: {
+    key: "close",
+    label: "arquivos",
+    view: "close",
+    limit: 1200,
+    nodeScale: 0.9,
+    labels: true
+  }
+};
+
 const elements = {
   serverStatus: document.querySelector("#serverStatus"),
   rootPath: document.querySelector("#rootPath"),
+  adaptiveScan: document.querySelector("#adaptiveScan"),
   maxFiles: document.querySelector("#maxFiles"),
   maxDepth: document.querySelector("#maxDepth"),
   maxFileSize: document.querySelector("#maxFileSize"),
@@ -41,6 +72,10 @@ const elements = {
   graphCanvas: document.querySelector("#graphCanvas"),
   graphHint: document.querySelector("#graphHint"),
   graphFilter: document.querySelector("#graphFilter"),
+  zoomLabel: document.querySelector("#zoomLabel"),
+  modeFar: document.querySelector("#modeFar"),
+  modeMedium: document.querySelector("#modeMedium"),
+  modeClose: document.querySelector("#modeClose"),
   nodeDetails: document.querySelector("#nodeDetails"),
   fileSearch: document.querySelector("#fileSearch"),
   filesTable: document.querySelector("#filesTable"),
@@ -54,6 +89,7 @@ init();
 async function init() {
   bindEvents();
   renderEmpty();
+  updateAdaptiveInputs();
 
   try {
     const health = await fetchJson("/api/health");
@@ -61,6 +97,8 @@ async function init() {
     elements.maxFiles.value = health.defaultOptions.maxFiles;
     elements.maxDepth.value = health.defaultOptions.maxDepth;
     elements.maxFileSize.value = health.defaultOptions.maxFileSizeBytes;
+    elements.adaptiveScan.checked = health.defaultOptions.adaptive !== false;
+    updateAdaptiveInputs();
     setStatus("pronto", "ok");
   } catch (error) {
     setStatus("servidor indisponível", "error");
@@ -71,8 +109,23 @@ function bindEvents() {
   elements.scanButton.addEventListener("click", runScan);
   elements.exportButton.addEventListener("click", exportJson);
   elements.graphFilter.addEventListener("change", renderGraph);
-  elements.fileSearch.addEventListener("input", renderFiles);
+  elements.fileSearch.addEventListener("input", () => {
+    renderFiles();
+    renderGraph();
+  });
+  elements.adaptiveScan.addEventListener("change", updateAdaptiveInputs);
   elements.graphCanvas.addEventListener("click", selectCanvasNode);
+  elements.graphCanvas.addEventListener("mousemove", hoverCanvasNode);
+  elements.graphCanvas.addEventListener("mouseleave", () => {
+    if (state.hoveredNodeId) {
+      state.hoveredNodeId = null;
+      renderGraph();
+    }
+  });
+  elements.graphCanvas.addEventListener("wheel", handleGraphWheel, { passive: false });
+  elements.modeFar?.addEventListener("click", () => setGraphMode("far"));
+  elements.modeMedium?.addEventListener("click", () => setGraphMode("medium"));
+  elements.modeClose?.addEventListener("click", () => setGraphMode("close"));
 
   document.querySelectorAll(".tab").forEach((button) => {
     button.addEventListener("click", () => {
@@ -94,6 +147,30 @@ function bindEvents() {
   });
 }
 
+function updateAdaptiveInputs() {
+  const disabled = elements.adaptiveScan.checked;
+  elements.maxFiles.disabled = disabled;
+  elements.maxDepth.disabled = disabled;
+  elements.maxFileSize.disabled = disabled;
+}
+
+function setGraphMode(modeKey) {
+  const zoomByMode = {
+    far: 0.62,
+    medium: 1,
+    close: 2.05
+  };
+  state.zoom = zoomByMode[modeKey] || 1;
+  renderGraph();
+}
+
+function handleGraphWheel(event) {
+  event.preventDefault();
+  const factor = event.deltaY < 0 ? 1.12 : 0.88;
+  state.zoom = clamp(state.zoom * factor, 0.45, 2.8);
+  renderGraph();
+}
+
 async function runScan() {
   const rootPath = elements.rootPath.value.trim();
   if (!rootPath) {
@@ -102,14 +179,14 @@ async function runScan() {
     return;
   }
 
-  const payload = {
-    rootPath,
-    options: {
-      maxFiles: Number(elements.maxFiles.value),
-      maxDepth: Number(elements.maxDepth.value),
-      maxFileSizeBytes: Number(elements.maxFileSize.value)
-    }
-  };
+  const options = elements.adaptiveScan.checked
+    ? { adaptive: true }
+    : {
+        adaptive: false,
+        maxFiles: Number(elements.maxFiles.value),
+        maxDepth: Number(elements.maxDepth.value),
+        maxFileSizeBytes: Number(elements.maxFileSize.value)
+      };
 
   elements.scanButton.disabled = true;
   elements.exportButton.disabled = true;
@@ -119,10 +196,11 @@ async function runScan() {
     state.result = await fetchJson("/api/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({ rootPath, options })
     });
     state.selectedNodeId = null;
     elements.exportButton.disabled = false;
+    syncOptionsFromResult();
     setStatus(`ok · ${state.result.summary.elapsedMs} ms`, "ok");
     renderAll();
   } catch (error) {
@@ -131,6 +209,15 @@ async function runScan() {
   } finally {
     elements.scanButton.disabled = false;
   }
+}
+
+function syncOptionsFromResult() {
+  if (!state.result?.options) {
+    return;
+  }
+  elements.maxFiles.value = state.result.options.maxFiles;
+  elements.maxDepth.value = state.result.options.maxDepth;
+  elements.maxFileSize.value = state.result.options.maxFileSizeBytes;
 }
 
 async function fetchJson(url, options) {
@@ -159,19 +246,20 @@ function renderAll() {
 
 function renderEmpty() {
   elements.metrics.innerHTML = metricMarkup([
+    ["0", "entradas"],
     ["0", "arquivos"],
     ["0", "diretórios"],
     ["0", "arestas"],
-    ["0", "componentes"],
     ["0", "alto risco"],
     ["0", "médio risco"],
     ["0", "baixo risco"],
-    ["0", "isolados"]
+    ["0", "candidatos"]
   ]);
   elements.filesTable.innerHTML = empty("Nenhuma varredura executada.");
   elements.dependenciesTable.innerHTML = empty("Nenhuma dependência detectada ainda.");
   elements.simulationGrid.innerHTML = "";
   elements.warningsList.innerHTML = empty("Sem avisos.");
+  updateZoomLabel();
 }
 
 function renderError(message) {
@@ -188,15 +276,16 @@ function renderMetrics() {
     return;
   }
   const summary = state.result.summary;
+  const scale = state.result.scaleEstimate?.scale || "n/d";
   elements.metrics.innerHTML = metricMarkup([
+    [summary.entries, "entradas lidas"],
     [summary.files, "arquivos"],
     [summary.directories, "diretórios"],
-    [summary.edges, "arestas"],
-    [summary.components, "componentes"],
+    [summary.canDelete || 0, "pode apagar"],
+    [summary.probablyUseless || 0, "inútil provável"],
+    [summary.mustKeep || 0, "não apagar"],
     [summary.byRisk.alto || 0, "alto risco"],
-    [summary.byRisk.medio || 0, "médio risco"],
-    [summary.byRisk.baixo || 0, "baixo risco"],
-    [summary.candidateLowRisk, "isolados candidatos"]
+    [summary.staleCandidates || summary.candidateLowRisk, `candidatos · ${scale}`]
   ]);
 }
 
@@ -226,121 +315,537 @@ function renderGraph() {
   const width = rect.width;
   const height = rect.height;
   context.clearRect(0, 0, width, height);
-  context.fillStyle = "#ffffff";
-  context.fillRect(0, 0, width, height);
 
-  const visibleNodes = selectGraphNodes();
+  const mode = resolveGraphMode();
+  state.graphMode = mode.key;
+  const baseView = state.result.graphViews?.[mode.view] || fallbackGraphView();
+  const view = buildInteractiveGraphView(baseView, mode);
+  const visibleNodes = selectGraphNodes(view.nodes, mode);
   const visibleIds = new Set(visibleNodes.map((node) => node.id));
-  const edges = state.result.edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
+  const edges = view.edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
+  state.currentGraphNodes = visibleNodes;
+  state.currentGraphEdges = edges;
 
-  elements.graphHint.textContent = `${visibleNodes.length} nós renderizados de ${state.result.summary.files}; ${edges.length} arestas visíveis.`;
+  elements.graphHint.textContent = `${mode.label} · ${visibleNodes.length}/${view.nodes.length} nós · ${focusText()}`;
+  updateZoomLabel(mode);
 
   if (!visibleNodes.length) {
     clearCanvas("Nenhum nó dentro do filtro atual.");
     return;
   }
 
-  const layout = computeColumnLayout(visibleNodes, width, height);
+  const layout = computeImpactLayout(visibleNodes, width, height, mode);
   state.graphLayout = layout;
 
+  drawGraphBackdrop(context, width, height);
+  drawDecisionZones(context, width, height, mode);
+  drawEdges(context, edges, layout);
+  drawNodes(context, layout, mode);
+}
+
+function resolveGraphMode() {
+  if (state.zoom < 0.82) {
+    return graphModes.far;
+  }
+  if (state.zoom < 1.65) {
+    return graphModes.medium;
+  }
+  return graphModes.close;
+}
+
+function updateZoomLabel(mode = resolveGraphMode()) {
+  if (!elements.zoomLabel) {
+    return;
+  }
+  elements.zoomLabel.textContent = `${mode.label} · ${Math.round(state.zoom * 100)}%`;
+  elements.modeFar?.classList.toggle("is-active", mode.key === "far");
+  elements.modeMedium?.classList.toggle("is-active", mode.key === "medium");
+  elements.modeClose?.classList.toggle("is-active", mode.key === "close");
+}
+
+function fallbackGraphView() {
+  return {
+    nodes: state.result.nodes.filter((node) => node.kind === "file").map((node) => ({
+      ...node,
+      label: node.name || node.relativePath,
+      fileCount: 1,
+      directoryCount: 0,
+      children: [node.id]
+    })),
+    edges: state.result.edges
+  };
+}
+
+function buildInteractiveGraphView(baseView, mode) {
+  if (!state.result || mode.key === "far") {
+    return baseView;
+  }
+
+  const files = state.result.nodes.filter((node) => node.kind === "file");
+  const groups = new Map();
+  for (const file of files) {
+    const key = groupKeyForFile(file, mode);
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(file);
+  }
+
+  const nodes = [];
+  const fileToVisibleNode = new Map();
+
+  for (const [key, groupFiles] of groups.entries()) {
+    const groupId = `group:${mode.key}:${key}`;
+    const shouldGroup = groupFiles.length > 1 || mode.key === "medium";
+    const expanded = state.expandedGroups.has(groupId);
+
+    if (!shouldGroup) {
+      const file = groupFiles[0];
+      nodes.push(fileToGraphNode(file, "file"));
+      fileToVisibleNode.set(file.id, file.id);
+      continue;
+    }
+
+    const groupNode = buildUiGroupNode(groupId, key, groupFiles, mode, expanded);
+    nodes.push(groupNode);
+
+    if (expanded) {
+      for (const file of groupFiles) {
+        const child = fileToGraphNode(file, "expanded_file");
+        child.parentGroupId = groupId;
+        child.label = file.name;
+        nodes.push(child);
+        fileToVisibleNode.set(file.id, file.id);
+      }
+    } else {
+      for (const file of groupFiles) {
+        fileToVisibleNode.set(file.id, groupId);
+      }
+    }
+  }
+
+  return {
+    ...baseView,
+    nodes,
+    edges: aggregateVisibleEdges(state.result.edges, fileToVisibleNode)
+  };
+}
+
+function groupKeyForFile(file, mode) {
+  const dir = topDirectoryFromPath(file.relativePath);
+  const decision = file.deletionDecision || "averiguar";
+  if (mode.key === "close") {
+    return `${decision}|${dir}|${file.extension || "sem_ext"}`;
+  }
+  return `${decision}|${dir}`;
+}
+
+function buildUiGroupNode(groupId, key, files, mode, expanded) {
+  const [decision, dir, extension] = key.split("|");
+  const labelParts = mode.key === "close"
+    ? [decisionLabel(decision), dir, extension || "sem ext"]
+    : [decisionLabel(decision), dir];
+  const incoming = files.reduce((sum, file) => sum + (file.incoming || 0), 0);
+  const outgoing = files.reduce((sum, file) => sum + (file.outgoing || 0), 0);
+  const impactCount = files.reduce((sum, file) => sum + (file.impactCount || 0), 0);
+  const size = files.reduce((sum, file) => sum + (file.size || 0), 0);
+  const dominantFile = files
+    .slice()
+    .sort((a, b) => dependencyScore(b) - dependencyScore(a) || String(a.name).localeCompare(String(b.name)))[0];
+
+  return {
+    id: groupId,
+    kind: "ui_group",
+    label: `${labelParts.filter(Boolean).join(" · ")} (${files.length})`,
+    name: labelParts.filter(Boolean).join(" · "),
+    relativePath: dir,
+    extension: extension || "",
+    risk: maxRiskClient(files),
+    classification: "grupo",
+    fileCount: files.length,
+    directoryCount: new Set(files.map((file) => topDirectoryFromPath(file.relativePath))).size,
+    incoming,
+    outgoing,
+    impactCount,
+    dependencyScore: files.reduce((sum, file) => sum + dependencyScore(file), 0),
+    dominantFileName: dominantFile?.name || dominantFile?.relativePath || "",
+    depth: Math.max(0, ...files.map((file) => file.depth || 0)),
+    size,
+    daysSinceAccess: Math.min(...files.map((file) => Number(file.daysSinceAccess ?? 9999))),
+    deletionDecision: aggregateDeletionDecisionClient(files),
+    utilityStatus: aggregateUtilityStatusClient(files),
+    action: expanded ? "grupo_expandido" : "clique_para_expandir",
+    children: files.map((file) => file.id),
+    searchText: files.map((file) => file.relativePath).join(" "),
+    expanded,
+    groupReason: expanded ? "grupo aberto" : "grupo expansível"
+  };
+}
+
+function fileToGraphNode(file, kind) {
+  return {
+    ...file,
+    kind,
+    label: file.name || file.relativePath,
+    dependencyScore: dependencyScore(file),
+    dominantFileName: file.name || file.relativePath,
+    fileCount: 1,
+    directoryCount: 0,
+    children: [file.id],
+    action: file.simulationAction
+  };
+}
+
+function aggregateVisibleEdges(edges, fileToVisibleNode) {
+  const aggregate = new Map();
+  for (const edge of edges) {
+    const source = fileToVisibleNode.get(edge.source);
+    const target = fileToVisibleNode.get(edge.target);
+    if (!source || !target || source === target) {
+      continue;
+    }
+    const key = `${source}->${target}`;
+    if (!aggregate.has(key)) {
+      aggregate.set(key, {
+        id: key,
+        source,
+        target,
+        weight: 0,
+        types: {},
+        samples: []
+      });
+    }
+    const item = aggregate.get(key);
+    item.weight += 1;
+    item.types[edge.type] = (item.types[edge.type] || 0) + 1;
+    if (item.samples.length < 4) {
+      item.samples.push(edge);
+    }
+  }
+  return Array.from(aggregate.values());
+}
+
+function selectGraphNodes(nodes, mode) {
+  const filter = elements.graphFilter.value;
+  const query = elements.fileSearch.value.trim().toLowerCase();
+  return nodes
+    .filter((node) => filter === "all" || node.risk === filter)
+    .filter((node) => {
+      if (!query) {
+        return true;
+      }
+      const haystack = [
+        node.label,
+        node.name,
+        node.relativePath,
+        node.searchText,
+        ...(node.children || [])
+      ].join(" ").toLowerCase();
+      return haystack.includes(query);
+    })
+    .sort((a, b) => {
+      const scoreA = riskWeight[a.risk] * 1000 + (a.incoming + a.outgoing) * 12 + (a.fileCount || 1) + a.depth * 4;
+      const scoreB = riskWeight[b.risk] * 1000 + (b.incoming + b.outgoing) * 12 + (b.fileCount || 1) + b.depth * 4;
+      return scoreB - scoreA || String(a.label).localeCompare(String(b.label));
+    })
+    .slice(0, mode.limit);
+}
+
+function focusText() {
+  const focused = state.hoveredNodeId || state.selectedNodeId;
+  if (!focused) {
+    return "visão limpa";
+  }
+  const node = state.currentGraphNodes.find((item) => item.id === focused);
+  return node ? `foco: ${trimLabel(node.label || node.relativePath, 28)}` : "foco ativo";
+}
+
+function computeImpactLayout(nodes, width, height, mode) {
+  const layout = new Map();
+  const zones = decisionZones(width, height);
+  const grouped = new Map();
+
+  for (const node of nodes) {
+    const key = zoneKeyFor(node);
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+    }
+    grouped.get(key).push(node);
+  }
+
+  for (const [key, groupNodes] of grouped.entries()) {
+    const zone = zones[key] || zones.averiguar;
+    groupNodes.sort((a, b) => {
+      const scoreA = (a.fileCount || 1) + (a.impactCount || 0) * 2 + (a.incoming || 0) * 3;
+      const scoreB = (b.fileCount || 1) + (b.impactCount || 0) * 2 + (b.incoming || 0) * 3;
+      return scoreB - scoreA || String(a.label).localeCompare(String(b.label));
+    });
+
+    groupNodes.forEach((node, index) => {
+      const spiral = Math.sqrt(index + 1) / Math.sqrt(groupNodes.length + 1);
+      const angle = index * 2.399963 + hashNumber(node.id) * 0.0008;
+      const jitter = mode.key === "close" ? 1.05 : mode.key === "far" ? 0.72 : 0.88;
+      const x = zone.x + Math.cos(angle) * zone.rx * spiral * jitter;
+      const y = zone.y + Math.sin(angle) * zone.ry * spiral * jitter;
+      const degree = (node.incoming || 0) + (node.outgoing || 0) + (node.impactCount || 0);
+      const mass = Math.max(1, node.fileCount || 1);
+      const radius = clamp((5 + Math.sqrt(degree + mass) * 2.4) * mode.nodeScale, mode.key === "close" ? 4 : 8, mode.key === "far" ? 36 : 24);
+
+      layout.set(node.id, {
+        x: clamp(x, radius + 16, width - radius - 16),
+        y: clamp(y, radius + 16, height - radius - 16),
+        radius,
+        node,
+        zoneKey: key
+      });
+    });
+  }
+
+  return layout;
+}
+
+function decisionZones(width, height) {
+  return {
+    pode_apagar: { x: width * 0.22, y: height * 0.7, rx: width * 0.16, ry: height * 0.18, label: "pode apagar", color: "#2f8f57" },
+    inutil_provavel: { x: width * 0.26, y: height * 0.32, rx: width * 0.16, ry: height * 0.18, label: "inútil provável", color: "#84a94f" },
+    averiguar: { x: width * 0.56, y: height * 0.48, rx: width * 0.19, ry: height * 0.24, label: "averiguar", color: "#d7a02c" },
+    nao_apagar: { x: width * 0.82, y: height * 0.48, rx: width * 0.15, ry: height * 0.28, label: "não apagar", color: "#c84444" }
+  };
+}
+
+function zoneKeyFor(node) {
+  return node.deletionDecision || node.relocationDecision || "averiguar";
+}
+
+function drawGraphBackdrop(context, width, height) {
+  const gradient = context.createLinearGradient(0, 0, width, height);
+  gradient.addColorStop(0, "#f7faf8");
+  gradient.addColorStop(0.5, "#ffffff");
+  gradient.addColorStop(1, "#f3f6f7");
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, width, height);
+
+  context.save();
+  context.globalAlpha = 0.45;
+  context.strokeStyle = "rgba(35, 43, 47, 0.06)";
   context.lineWidth = 1;
+  const step = 42;
+  for (let x = 0; x < width; x += step) {
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, height);
+    context.stroke();
+  }
+  for (let y = 0; y < height; y += step) {
+    context.beginPath();
+    context.moveTo(0, y);
+    context.lineTo(width, y);
+    context.stroke();
+  }
+  context.restore();
+}
+
+function drawDecisionZones(context, width, height) {
+  const zones = decisionZones(width, height);
+  context.save();
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  for (const zone of Object.values(zones)) {
+    const gradient = context.createRadialGradient(zone.x, zone.y, 6, zone.x, zone.y, Math.max(zone.rx, zone.ry));
+    gradient.addColorStop(0, hexToRgba(zone.color, 0.13));
+    gradient.addColorStop(1, hexToRgba(zone.color, 0));
+    context.fillStyle = gradient;
+    context.beginPath();
+    context.ellipse(zone.x, zone.y, zone.rx, zone.ry, 0, 0, Math.PI * 2);
+    context.fill();
+
+    context.fillStyle = hexToRgba(zone.color, 0.7);
+    context.font = "800 12px Segoe UI, sans-serif";
+    context.fillText(zone.label, zone.x, zone.y - zone.ry - 12);
+  }
+  context.restore();
+}
+
+function drawEdges(context, edges, layout) {
+  const focusId = state.hoveredNodeId || state.selectedNodeId;
+  context.save();
   for (const edge of edges) {
     const source = layout.get(edge.source);
     const target = layout.get(edge.target);
     if (!source || !target) {
       continue;
     }
-    context.beginPath();
-    context.strokeStyle = "rgba(49, 55, 58, 0.18)";
-    context.moveTo(source.x, source.y);
-    const midX = (source.x + target.x) / 2;
-    context.bezierCurveTo(midX, source.y, midX, target.y, target.x, target.y);
-    context.stroke();
-  }
+    const focused = focusId && (edge.source === focusId || edge.target === focusId);
+    const important = !focusId && Math.max(edge.weight || 1, source.node.impactCount || 0, target.node.impactCount || 0) >= 3;
+    if (!focused && !important) {
+      continue;
+    }
 
-  drawColumnLabels(context, width);
+    const weight = Math.max(1, edge.weight || 1);
+    context.beginPath();
+    context.strokeStyle = edgeColor(source.node.risk, target.node.risk, weight, focused);
+    context.lineWidth = focused ? clamp(1.4 + Math.sqrt(weight), 1.6, 5) : clamp(0.8 + Math.sqrt(weight) * 0.35, 0.8, 2.4);
+    context.moveTo(source.x, source.y);
+    context.lineTo(target.x, target.y);
+    context.stroke();
+    if (focused) {
+      drawArrowHead(context, source, target);
+    }
+  }
+  context.restore();
+}
+
+function drawArrowHead(context, source, target) {
+  const angle = Math.atan2(target.y - source.y, target.x - source.x);
+  const size = 6;
+  const x = target.x - Math.cos(angle) * (target.radius + 2);
+  const y = target.y - Math.sin(angle) * (target.radius + 2);
+  context.beginPath();
+  context.moveTo(x, y);
+  context.lineTo(x - Math.cos(angle - 0.45) * size, y - Math.sin(angle - 0.45) * size);
+  context.lineTo(x - Math.cos(angle + 0.45) * size, y - Math.sin(angle + 0.45) * size);
+  context.closePath();
+  context.fillStyle = context.strokeStyle;
+  context.fill();
+}
+
+function drawNodes(context, layout, mode) {
+  const focusId = state.hoveredNodeId || state.selectedNodeId;
+  const topLabelIds = topDependencyLabelIds(layout, mode);
+  context.save();
+  for (const point of layout.values()) {
+    const node = point.node;
+    const focused = node.id === focusId;
+    const selected = node.id === state.selectedNodeId;
+    const dim = focusId && !focused && !isConnectedToFocus(node.id);
+
+    context.globalAlpha = dim ? 0.28 : 1;
+    context.beginPath();
+    context.fillStyle = riskColors[node.risk] || "#81878b";
+    context.arc(point.x, point.y, point.radius, 0, Math.PI * 2);
+    context.fill();
+    context.lineWidth = selected ? 4 : focused ? 3 : 1.4;
+    context.strokeStyle = selected || focused ? "#182025" : "rgba(255, 255, 255, 0.92)";
+    context.stroke();
+
+    if ((node.fileCount > 1 || node.kind === "ui_group") && (mode.key !== "close" || focused || node.kind === "ui_group")) {
+      context.fillStyle = "#ffffff";
+      context.font = "800 11px Segoe UI, sans-serif";
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillText(node.expanded ? "−" : formatCompact(node.fileCount), point.x, point.y);
+    }
+  }
+  context.globalAlpha = 1;
 
   for (const point of layout.values()) {
     const node = point.node;
-    const degree = (node.incoming || 0) + (node.outgoing || 0);
-    const radius = Math.min(13, 5 + Math.sqrt(degree + 1) * 2);
-    context.beginPath();
-    context.fillStyle = classColors[node.classification] || "#767c80";
-    context.arc(point.x, point.y, radius, 0, Math.PI * 2);
-    context.fill();
-    context.lineWidth = node.id === state.selectedNodeId ? 3 : 1.5;
-    context.strokeStyle = node.id === state.selectedNodeId ? "#111" : "#fff";
-    context.stroke();
-  }
-}
-
-function selectGraphNodes() {
-  const filter = elements.graphFilter.value;
-  const nodes = state.result.nodes
-    .filter((node) => node.kind === "file")
-    .filter((node) => filter === "all" || node.risk === filter);
-
-  return nodes
-    .sort((a, b) => {
-      const scoreA = riskWeight[a.risk] * 100 + (a.incoming + a.outgoing) * 5 + a.depth;
-      const scoreB = riskWeight[b.risk] * 100 + (b.incoming + b.outgoing) * 5 + b.depth;
-      return scoreB - scoreA || a.relativePath.localeCompare(b.relativePath);
-    })
-    .slice(0, 260);
-}
-
-function computeColumnLayout(nodes, width, height) {
-  const groups = [
-    "critico_protegido",
-    "provedor",
-    "dependente_provedor",
-    "dependente",
-    "isolado"
-  ];
-  const grouped = new Map(groups.map((group) => [group, []]));
-  for (const node of nodes) {
-    if (!grouped.has(node.classification)) {
-      grouped.set(node.classification, []);
+    const focused = node.id === focusId;
+    const showLabel = focused || node.id === state.selectedNodeId || topLabelIds.has(node.id);
+    if (showLabel) {
+      drawNodeLabel(context, point, mode, { compact: topLabelIds.has(node.id) && !focused });
     }
-    grouped.get(node.classification).push(node);
   }
-
-  const layout = new Map();
-  const marginX = Math.max(30, width * 0.04);
-  const top = 58;
-  const bottom = 28;
-  const columnGap = groups.length > 1 ? (width - marginX * 2) / (groups.length - 1) : 0;
-
-  groups.forEach((group, columnIndex) => {
-    const columnNodes = grouped.get(group) || [];
-    const x = marginX + columnGap * columnIndex;
-    const availableHeight = Math.max(120, height - top - bottom);
-    columnNodes.forEach((node, rowIndex) => {
-      const y = top + ((rowIndex + 1) * availableHeight) / (columnNodes.length + 1);
-      layout.set(node.id, { x, y, node });
-    });
-  });
-
-  return layout;
+  context.restore();
 }
 
-function drawColumnLabels(context, width) {
-  const groups = [
-    ["critico_protegido", "crítico"],
-    ["provedor", "provedor"],
-    ["dependente_provedor", "misto"],
-    ["dependente", "dependente"],
-    ["isolado", "isolado"]
-  ];
-  const marginX = Math.max(30, width * 0.04);
-  const columnGap = groups.length > 1 ? (width - marginX * 2) / (groups.length - 1) : 0;
-  context.font = "700 12px Segoe UI, sans-serif";
+function drawNodeLabel(context, point, mode, options = {}) {
+  const labelSource = options.compact
+    ? point.node.dominantFileName || point.node.label || point.node.relativePath
+    : point.node.label || point.node.dominantFileName || point.node.relativePath;
+  const label = trimLabel(labelSource || "nó", mode.key === "close" ? 30 : 24);
+  context.font = mode.key === "close" ? "12px Cascadia Mono, Consolas, monospace" : "800 12px Segoe UI, sans-serif";
   context.textAlign = "center";
-  context.fillStyle = "#60676c";
-  groups.forEach(([key, label], index) => {
-    context.fillStyle = classColors[key] || "#60676c";
-    context.fillText(label, marginX + columnGap * index, 24);
+  context.textBaseline = "top";
+  const labelWidth = Math.min(210, context.measureText(label).width + 14);
+  const labelHeight = 20;
+  const x = point.x - labelWidth / 2;
+  const y = point.y + point.radius + 7;
+  context.fillStyle = "rgba(255, 255, 255, 0.94)";
+  roundRect(context, x, y, labelWidth, labelHeight, 6);
+  context.fill();
+  context.strokeStyle = "rgba(28, 34, 38, 0.12)";
+  context.stroke();
+  context.fillStyle = "#1c2226";
+  context.fillText(label, point.x, y + 3);
+}
+
+function importantNode(node) {
+  return node.risk === "alto" || node.deletionDecision === "pode_apagar" || (node.impactCount || 0) >= 4;
+}
+
+function topDependencyLabelIds(layout, mode) {
+  const maxLabels = mode.key === "far" ? 3 : mode.key === "medium" ? 5 : 8;
+  return new Set(
+    Array.from(layout.values())
+      .filter((point) => dependencyScore(point.node) > 0)
+      .sort((a, b) => dependencyScore(b.node) - dependencyScore(a.node))
+      .slice(0, maxLabels)
+      .map((point) => point.node.id)
+  );
+}
+
+function dependencyScore(node) {
+  return Number(node.dependencyScore ?? ((node.incoming || 0) * 3 + (node.outgoing || 0) * 2 + (node.impactCount || 0) * 4));
+}
+
+function topDirectoryFromPath(relativePath) {
+  const normalized = String(relativePath || ".").replace(/\\/g, "/");
+  if (!normalized || normalized === "." || !normalized.includes("/")) {
+    return ".";
+  }
+  return normalized.split("/")[0];
+}
+
+function maxRiskClient(files) {
+  if (files.some((file) => file.risk === "alto")) {
+    return "alto";
+  }
+  if (files.some((file) => file.risk === "medio")) {
+    return "medio";
+  }
+  return "baixo";
+}
+
+function aggregateDeletionDecisionClient(files) {
+  if (files.some((file) => file.deletionDecision === "nao_apagar")) {
+    return "nao_apagar";
+  }
+  if (files.some((file) => file.deletionDecision === "averiguar")) {
+    return "averiguar";
+  }
+  if (files.some((file) => file.deletionDecision === "inutil_provavel")) {
+    return "inutil_provavel";
+  }
+  return "pode_apagar";
+}
+
+function aggregateUtilityStatusClient(files) {
+  const statuses = new Set(files.map((file) => file.utilityStatus));
+  if (statuses.has("sistema")) return "sistema";
+  if (statuses.has("protegido")) return "protegido";
+  if (statuses.has("dependencia_relevante")) return "dependencia_relevante";
+  if (statuses.has("usado_pelo_usuario")) return "usado_pelo_usuario";
+  if (statuses.has("utilidade_incerta")) return "utilidade_incerta";
+  if (statuses.has("baixo_uso")) return "baixo_uso";
+  return "inutil_provavel";
+}
+
+function isConnectedToFocus(nodeId) {
+  const focusId = state.hoveredNodeId || state.selectedNodeId;
+  if (!focusId || nodeId === focusId) {
+    return true;
+  }
+  return state.currentGraphEdges.some((edge) => {
+    return (edge.source === focusId && edge.target === nodeId) || (edge.target === focusId && edge.source === nodeId);
   });
+}
+
+function edgeColor(sourceRisk, targetRisk, weight, focused = false) {
+  const risk = riskWeight[sourceRisk] >= riskWeight[targetRisk] ? sourceRisk : targetRisk;
+  const color = riskColors[risk] || "#60676c";
+  const alpha = focused ? 0.66 : clamp(0.12 + weight * 0.04, 0.14, 0.32);
+  return hexToRgba(color, alpha);
 }
 
 function clearCanvas(message) {
@@ -348,19 +853,49 @@ function clearCanvas(message) {
   const context = canvas.getContext("2d");
   const rect = canvas.getBoundingClientRect();
   context.clearRect(0, 0, canvas.width, canvas.height);
-  context.fillStyle = "#ffffff";
-  context.fillRect(0, 0, rect.width || canvas.width, rect.height || canvas.height);
+  drawGraphBackdrop(context, rect.width || canvas.width, rect.height || canvas.height);
   context.fillStyle = "#626a70";
   context.font = "14px Segoe UI, sans-serif";
   context.fillText(message, 18, 32);
   elements.graphHint.textContent = message;
   state.graphLayout = new Map();
+  state.currentGraphNodes = [];
+  state.currentGraphEdges = [];
+}
+
+function hoverCanvasNode(event) {
+  if (!state.graphLayout.size) {
+    return;
+  }
+  const point = nearestCanvasPoint(event);
+  const nextHoverId = point ? point.node.id : null;
+  elements.graphCanvas.style.cursor = point ? "pointer" : "grab";
+  if (state.hoveredNodeId !== nextHoverId) {
+    state.hoveredNodeId = nextHoverId;
+    renderGraph();
+  }
 }
 
 function selectCanvasNode(event) {
   if (!state.graphLayout.size) {
     return;
   }
+  const nearest = nearestCanvasPoint(event);
+  if (nearest) {
+    state.selectedNodeId = nearest.node.id;
+    if (nearest.node.kind === "ui_group") {
+      if (state.expandedGroups.has(nearest.node.id)) {
+        state.expandedGroups.delete(nearest.node.id);
+      } else {
+        state.expandedGroups.add(nearest.node.id);
+      }
+    }
+    renderNodeDetails();
+    renderGraph();
+  }
+}
+
+function nearestCanvasPoint(event) {
   const rect = elements.graphCanvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
   const y = event.clientY - rect.top;
@@ -371,19 +906,17 @@ function selectCanvasNode(event) {
     const distance = Math.hypot(point.x - x, point.y - y);
     if (distance < nearestDistance) {
       nearestDistance = distance;
-      nearest = point.node;
+      nearest = point;
     }
   }
 
-  if (nearest && nearestDistance <= 24) {
-    state.selectedNodeId = nearest.id;
-    renderNodeDetails();
-    renderGraph();
-  }
+  return nearest && nearestDistance <= nearest.radius + 12 ? nearest : null;
 }
 
 function renderNodeDetails() {
-  const node = state.result?.nodes.find((item) => item.id === state.selectedNodeId);
+  const graphNode = state.currentGraphNodes.find((item) => item.id === state.selectedNodeId);
+  const fileNode = state.result?.nodes.find((item) => item.id === state.selectedNodeId);
+  const node = graphNode || fileNode;
   if (!node) {
     elements.nodeDetails.innerHTML = `
       <h2>Nó selecionado</h2>
@@ -392,24 +925,41 @@ function renderNodeDetails() {
     return;
   }
 
-  const reasons = node.protectedReasons?.length ? node.protectedReasons.join(", ") : "sem proteção especial";
+  const childFiles = (node.children || [])
+    .map((id) => state.result.nodes.find((item) => item.id === id))
+    .filter(Boolean);
+  const samples = childFiles.slice(0, 8).map((item) => item.relativePath).join("; ");
+  const reasons = node.protectedReasons?.length ? node.protectedReasons.join(", ") : node.groupReason || "sem proteção especial";
+  const riskReasons = node.riskReasons?.length ? node.riskReasons.join("; ") : reasons;
   const unresolved = node.unresolvedSpecifiers?.length
     ? node.unresolvedSpecifiers.map((item) => `${item.type}: ${item.specifier}`).join("; ")
     : "nenhuma";
 
   elements.nodeDetails.innerHTML = `
-    <h2>${escapeHtml(node.name)}</h2>
+    <h2>${escapeHtml(node.label || node.name || node.relativePath)}</h2>
     <dl>
-      <dt>caminho</dt><dd>${escapeHtml(node.relativePath)}</dd>
-      <dt>classe</dt><dd>${escapeHtml(labels[node.classification] || node.classification)}</dd>
+      <dt>visão</dt><dd>${escapeHtml(graphModes[state.graphMode]?.label || "arquivo")}</dd>
+      <dt>caminho</dt><dd>${escapeHtml(node.relativePath || "-")}</dd>
+      <dt>classe</dt><dd>${escapeHtml(labels[node.classification] || node.classification || "-")}</dd>
       <dt>risco</dt><dd>${riskMarkup(node.risk)}</dd>
+      <dt>apagar</dt><dd>${escapeHtml(decisionLabel(node.deletionDecision))}</dd>
+      <dt>utilidade</dt><dd>${escapeHtml(utilityLabel(node.utilityStatus))}</dd>
+      <dt>sistema</dt><dd>${escapeHtml(impactLabel(node.impact?.system))}</dd>
+      <dt>usuário</dt><dd>${escapeHtml(impactLabel(node.impact?.user))}</dd>
+      <dt>deps</dt><dd>${escapeHtml(impactLabel(node.impact?.dependencies))}</dd>
+      <dt>arquivos</dt><dd>${formatNumber(node.fileCount || 1)}</dd>
+      <dt>diretórios</dt><dd>${formatNumber(node.directoryCount || 0)}</dd>
       <dt>entrada</dt><dd>${formatNumber(node.incoming || 0)}</dd>
       <dt>saída</dt><dd>${formatNumber(node.outgoing || 0)}</dd>
+      <dt>impacto</dt><dd>${formatNumber(node.impactCount || 0)}</dd>
+      <dt>score</dt><dd>${formatNumber(node.riskScore || 0)}</dd>
       <dt>profundidade</dt><dd>${formatNumber(node.depth || 0)}</dd>
       <dt>tamanho</dt><dd>${formatBytes(node.size || 0)}</dd>
-      <dt>ação</dt><dd>${escapeHtml(node.simulationAction || "-")}</dd>
-      <dt>proteção</dt><dd>${escapeHtml(reasons)}</dd>
+      <dt>último uso</dt><dd>${formatAccess(node.daysSinceAccess)}</dd>
+      <dt>ação</dt><dd>${escapeHtml(node.action || node.simulationAction || "-")}</dd>
+      <dt>motivo</dt><dd>${escapeHtml(riskReasons)}</dd>
       <dt>pendências</dt><dd>${escapeHtml(unresolved)}</dd>
+      <dt>amostra</dt><dd>${escapeHtml(samples || "-")}</dd>
     </dl>
   `;
 }
@@ -439,10 +989,14 @@ function renderFiles() {
       <thead>
         <tr>
           <th>Risco</th>
+          <th>Apagar</th>
+          <th>Utilidade</th>
           <th>Classe</th>
           <th>Entrada</th>
           <th>Saída</th>
+          <th>Impacto</th>
           <th>Prof.</th>
+          <th>Último uso</th>
           <th>Tamanho</th>
           <th>Caminho</th>
         </tr>
@@ -451,10 +1005,14 @@ function renderFiles() {
         ${rows.map((node) => `
           <tr data-node-id="${escapeHtml(node.id)}">
             <td>${riskMarkup(node.risk)}</td>
+            <td>${escapeHtml(decisionLabel(node.deletionDecision))}</td>
+            <td>${escapeHtml(utilityLabel(node.utilityStatus))}</td>
             <td>${escapeHtml(labels[node.classification] || node.classification)}</td>
             <td>${formatNumber(node.incoming || 0)}</td>
             <td>${formatNumber(node.outgoing || 0)}</td>
+            <td>${formatNumber(node.impactCount || 0)}</td>
             <td>${formatNumber(node.depth || 0)}</td>
+            <td>${formatAccess(node.daysSinceAccess)}</td>
             <td>${formatBytes(node.size || 0)}</td>
             <td class="path-cell">${escapeHtml(node.relativePath)}</td>
           </tr>
@@ -465,6 +1023,7 @@ function renderFiles() {
 
   elements.filesTable.querySelectorAll("tr[data-node-id]").forEach((row) => {
     row.addEventListener("click", () => {
+      state.zoom = 1.9;
       state.selectedNodeId = row.dataset.nodeId;
       renderNodeDetails();
       renderGraph();
@@ -477,24 +1036,28 @@ function renderSimulation() {
     return;
   }
 
-  const buckets = [
-    ["isolados", "Isolados", "baixo risco para separação"],
-    ["dependentes", "Dependentes", "mover junto dos fornecedores"],
-    ["provedores", "Provedores", "mantêm outros arquivos vivos"],
-    ["mistos", "Dependente/provedor", "exigem revisão de cadeia"],
-    ["protegidos", "Críticos/protegidos", "não mover automaticamente"],
-    ["revisar", "Revisar", "casos sem classe clara"]
+  const groups = [
+    ["pode_apagar", "Pode apagar", "não afeta sistema nem dependências relevantes"],
+    ["inutil_provavel", "Inútil provável", "baixo uso, baixo impacto, bom candidato"],
+    ["averiguar", "Averiguar", "incerteza, uso ou dependência moderada"],
+    ["nao_apagar", "Não apagar", "sistema, uso recente ou impacto alto"]
   ];
+  const decisions = state.result.simulation.decisionGroups || {};
 
-  elements.simulationGrid.innerHTML = buckets.map(([key, title, subtitle]) => {
-    const items = state.result.simulation.buckets[key] || [];
+  elements.simulationGrid.innerHTML = groups.map(([key, title, subtitle]) => {
+    const items = decisions[key] || [];
     return `
       <article class="bucket">
         <h3>${escapeHtml(title)} · ${formatNumber(items.length)}</h3>
         <p class="muted">${escapeHtml(subtitle)}</p>
         ${items.length ? `
           <ol>
-            ${items.slice(0, 18).map((item) => `<li>${escapeHtml(item.path)}</li>`).join("")}
+            ${items.slice(0, 24).map((item) => `
+              <li>
+                ${escapeHtml(item.path)}
+                <span class="muted">${escapeHtml(item.reason)}</span>
+              </li>
+            `).join("")}
           </ol>
         ` : `<p class="muted">Nenhum item.</p>`}
       </article>
@@ -580,6 +1143,57 @@ function riskMarkup(risk) {
   return `<span class="risk ${escapeHtml(risk)}">${escapeHtml(risk)}</span>`;
 }
 
+function decisionLabel(value) {
+  const labels = {
+    pode_apagar: "pode apagar",
+    inutil_provavel: "inútil provável",
+    averiguar: "averiguar",
+    nao_apagar: "não apagar"
+  };
+  return labels[value] || value || "-";
+}
+
+function utilityLabel(value) {
+  const labels = {
+    sistema: "sistema",
+    protegido: "protegido",
+    usado_pelo_usuario: "usado",
+    dependencia_relevante: "dependência relevante",
+    inutil_provavel: "inútil provável",
+    baixo_uso: "baixo uso",
+    utilidade_incerta: "incerta",
+    desconhecido: "desconhecida"
+  };
+  return labels[value] || value || "-";
+}
+
+function impactLabel(value) {
+  const labels = {
+    afeta_sistema: "afeta sistema",
+    nao_afeta_sistema: "não afeta sistema",
+    protegido: "protegido",
+    alto: "alto",
+    medio: "médio",
+    baixo: "baixo",
+    nenhum: "nenhum",
+    incerto: "incerto"
+  };
+  return labels[value] || value || "-";
+}
+
+function formatAccess(days) {
+  if (!Number.isFinite(Number(days))) {
+    return "-";
+  }
+  if (days <= 0) {
+    return "hoje";
+  }
+  if (days === 1) {
+    return "1 dia";
+  }
+  return `${formatNumber(days)} dias`;
+}
+
 function formatBytes(bytes) {
   if (bytes < 1024) {
     return `${bytes} B`;
@@ -592,6 +1206,58 @@ function formatBytes(bytes) {
 
 function formatNumber(value) {
   return new Intl.NumberFormat("pt-BR").format(Number(value || 0));
+}
+
+function formatCompact(value) {
+  if (value >= 1000) {
+    return `${Math.round(value / 100) / 10}k`;
+  }
+  return String(value);
+}
+
+function trimLabel(value, maxLength) {
+  const text = String(value || "");
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(3, maxLength - 1))}…`;
+}
+
+function hexToRgba(hex, alpha) {
+  const clean = hex.replace("#", "");
+  const bigint = Number.parseInt(clean, 16);
+  const r = (bigint >> 16) & 255;
+  const g = (bigint >> 8) & 255;
+  const b = bigint & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function hashNumber(value) {
+  let hash = 2166136261;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return Math.abs(hash >>> 0);
+}
+
+function roundRect(context, x, y, width, height, radius) {
+  const safeRadius = Math.min(radius, width / 2, height / 2);
+  context.beginPath();
+  context.moveTo(x + safeRadius, y);
+  context.lineTo(x + width - safeRadius, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + safeRadius);
+  context.lineTo(x + width, y + height - safeRadius);
+  context.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height);
+  context.lineTo(x + safeRadius, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - safeRadius);
+  context.lineTo(x, y + safeRadius);
+  context.quadraticCurveTo(x, y, x + safeRadius, y);
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function empty(message) {

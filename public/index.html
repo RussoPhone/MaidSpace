@@ -7,132 +7,139 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand">
-        <span class="brand-mark">A.D.D</span>
-        <div>
-          <h1>Sistema de Relocação Contínua</h1>
-          <p>Algoritmo Determinação Dependência</p>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand">
+          <span class="brand-mark">ADD</span>
+          <div>
+            <h1>S.R.C · Algoritmo Determinação Dependência</h1>
+            <p>Mapa de impacto para realocação contínua de espaço</p>
+          </div>
         </div>
-      </div>
-      <span id="serverStatus" class="status-pill">conectando</span>
-    </header>
+        <div class="header-actions">
+          <span id="serverStatus" class="status-pill">conectando</span>
+          <button id="exportButton" class="ghost-button" type="button" disabled title="Exportar relatório JSON">
+            <span aria-hidden="true">⇩</span>
+            JSON
+          </button>
+        </div>
+      </header>
 
-    <main>
-      <section class="scan-band" aria-label="Configuração de varredura">
-        <label class="field field-grow">
-          <span>Diretório raiz</span>
-          <input id="rootPath" type="text" spellcheck="false" placeholder="C:\Users\seu-usuario\projeto">
-        </label>
-        <label class="field">
-          <span>Máximo de arquivos</span>
-          <input id="maxFiles" type="number" min="100" max="50000" step="100" value="5000">
-        </label>
-        <label class="field">
-          <span>Profundidade</span>
-          <input id="maxDepth" type="number" min="1" max="64" step="1" value="18">
-        </label>
-        <label class="field">
-          <span>Leitura por arquivo</span>
-          <select id="maxFileSize">
-            <option value="131072">128 KB</option>
-            <option value="524288" selected>512 KB</option>
-            <option value="1048576">1 MB</option>
-            <option value="5242880">5 MB</option>
-          </select>
-        </label>
-        <button id="scanButton" class="primary-button" type="button" title="Executar varredura do A.D.D">
-          <span aria-hidden="true">▶</span>
-          Escanear
-        </button>
-        <button id="exportButton" class="secondary-button" type="button" disabled title="Exportar relatório JSON">
-          <span aria-hidden="true">⇩</span>
-          JSON
-        </button>
-      </section>
+      <aside class="control-rail" aria-label="Controle de varredura">
+        <section class="rail-section">
+          <h2>Varredura</h2>
+          <label class="field">
+            <span>Diretório raiz</span>
+            <input id="rootPath" type="text" spellcheck="false" placeholder="C:\Users\seu-usuario\projeto">
+          </label>
+          <label class="inline-check">
+            <input id="adaptiveScan" type="checkbox" checked>
+            <b>Leitura adaptável</b>
+          </label>
+          <div class="compact-grid">
+            <label class="field">
+              <span>Arquivos</span>
+              <input id="maxFiles" type="number" min="100" max="50000" step="100" value="5000">
+            </label>
+            <label class="field">
+              <span>Prof.</span>
+              <input id="maxDepth" type="number" min="1" max="64" step="1" value="18">
+            </label>
+          </div>
+          <label class="field">
+            <span>Leitura por arquivo</span>
+            <select id="maxFileSize">
+              <option value="131072">128 KB</option>
+              <option value="262144">256 KB</option>
+              <option value="524288" selected>512 KB</option>
+              <option value="1048576">1 MB</option>
+              <option value="5242880">5 MB</option>
+            </select>
+          </label>
+          <button id="scanButton" class="primary-button" type="button" title="Executar A.D.D">
+            <span aria-hidden="true">▶</span>
+            Escanear A.D.D
+          </button>
+        </section>
 
-      <section id="metrics" class="metrics" aria-label="Resumo do relatório"></section>
+        <section class="rail-section">
+          <h2>Grafo</h2>
+          <div class="mode-stack" aria-label="Modos de zoom">
+            <button id="modeFar" class="mode-button" type="button">Mapa</button>
+            <button id="modeMedium" class="mode-button is-active" type="button">Grupos</button>
+            <button id="modeClose" class="mode-button" type="button">Arquivos</button>
+          </div>
+          <label class="field">
+            <span>Filtro de risco</span>
+            <select id="graphFilter" title="Filtrar nós do grafo">
+              <option value="all">Todos</option>
+              <option value="alto">Alto</option>
+              <option value="medio">Médio</option>
+              <option value="baixo">Baixo</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Buscar arquivo</span>
+            <input id="fileSearch" class="search-input" type="search" placeholder="nome ou caminho">
+          </label>
+          <p class="microcopy">Use a roda do mouse sobre o grafo para alternar entre diretórios, grupos e arquivos.</p>
+        </section>
+      </aside>
 
-      <nav class="tabs" aria-label="Visões do A.D.D">
-        <button class="tab is-active" data-tab="graph" type="button">Grafo</button>
-        <button class="tab" data-tab="files" type="button">Arquivos</button>
-        <button class="tab" data-tab="simulation" type="button">Simulação</button>
-        <button class="tab" data-tab="dependencies" type="button">Dependências</button>
-        <button class="tab" data-tab="warnings" type="button">Avisos</button>
-      </nav>
+      <main class="graph-workbench">
+        <section class="metrics-strip" id="metrics" aria-label="Resumo do relatório"></section>
 
-      <section id="tab-graph" class="tab-panel is-active">
-        <div class="graph-layout">
-          <div class="graph-shell">
-            <div class="panel-heading">
-              <div>
-                <h2>Grafo de dependências</h2>
-                <p id="graphHint">Execute uma varredura para renderizar os nós.</p>
-              </div>
-              <select id="graphFilter" title="Filtrar nós do grafo">
-                <option value="all">Todos</option>
-                <option value="alto">Risco alto</option>
-                <option value="medio">Risco médio</option>
-                <option value="baixo">Risco baixo</option>
-              </select>
+        <section class="graph-stage graph-lens" aria-label="Grafo de dependências">
+          <div class="stage-toolbar">
+            <div>
+              <h2>Mapa de impacto</h2>
+              <p id="graphHint">Execute uma varredura para renderizar os nós.</p>
             </div>
-            <canvas id="graphCanvas" width="1100" height="620" aria-label="Canvas do grafo"></canvas>
-            <div class="legend" aria-label="Legenda">
-              <span><b class="dot dot-protected"></b>crítico/protegido</span>
-              <span><b class="dot dot-provider"></b>provedor</span>
-              <span><b class="dot dot-mixed"></b>dependente/provedor</span>
-              <span><b class="dot dot-dependent"></b>dependente</span>
-              <span><b class="dot dot-isolated"></b>isolado</span>
+            <span id="zoomLabel" class="zoom-label">médio · 100%</span>
+          </div>
+          <canvas id="graphCanvas" width="1200" height="720" aria-label="Canvas do grafo A.D.D"></canvas>
+          <div class="legend" aria-label="Legenda">
+            <span><b class="dot dot-low"></b>baixo risco</span>
+            <span><b class="dot dot-medium"></b>médio risco</span>
+            <span><b class="dot dot-high"></b>alto risco</span>
+            <span>passe o mouse para revelar conexões</span>
+          </div>
+        </section>
+
+        <section class="decision-dock" aria-label="Fila de decisão para A.R.E">
+          <div class="dock-heading">
+            <div>
+              <h2>Fila A.R.E</h2>
+              <p>Resposta direta: pode apagar, parece inútil, precisa averiguar ou não deve apagar.</p>
             </div>
           </div>
-          <aside id="nodeDetails" class="details-panel">
-            <h2>Nó selecionado</h2>
-            <p class="muted">Clique em um nó do grafo ou em uma linha da tabela.</p>
-          </aside>
-        </div>
-      </section>
+          <div id="simulationGrid" class="decision-grid"></div>
+        </section>
 
-      <section id="tab-files" class="tab-panel">
-        <div class="panel-heading">
-          <div>
-            <h2>Arquivos classificados</h2>
-            <p>Classificação primária, grau de dependência e risco calculado.</p>
+        <section class="data-dock" aria-label="Dados da varredura">
+          <div class="dock-heading">
+            <div>
+              <h2>Arquivos classificados</h2>
+              <p>Lista viva sincronizada com o grafo e o filtro de busca.</p>
+            </div>
           </div>
-          <input id="fileSearch" class="search-input" type="search" placeholder="Filtrar por caminho">
-        </div>
-        <div id="filesTable" class="table-wrap"></div>
-      </section>
+          <div id="filesTable" class="table-wrap"></div>
+          <details>
+            <summary>Dependências detectadas</summary>
+            <div id="dependenciesTable" class="table-wrap"></div>
+          </details>
+          <details>
+            <summary>Avisos e ignorados</summary>
+            <div id="warningsList" class="warning-list"></div>
+          </details>
+        </section>
+      </main>
 
-      <section id="tab-simulation" class="tab-panel">
-        <div class="panel-heading">
-          <div>
-            <h2>Simulação de separação</h2>
-            <p>Como o A.D.D prepara material para o A.R.E sem tocar nos arquivos.</p>
-          </div>
-        </div>
-        <div id="simulationGrid" class="bucket-grid"></div>
-      </section>
-
-      <section id="tab-dependencies" class="tab-panel">
-        <div class="panel-heading">
-          <div>
-            <h2>Dependências detectadas</h2>
-            <p>Arestas locais resolvidas por import, include, asset, módulo ou pacote.</p>
-          </div>
-        </div>
-        <div id="dependenciesTable" class="table-wrap"></div>
-      </section>
-
-      <section id="tab-warnings" class="tab-panel">
-        <div class="panel-heading">
-          <div>
-            <h2>Avisos e diretórios ignorados</h2>
-            <p>Itens pulados por limite, segurança, permissão ou diretórios gerados.</p>
-          </div>
-        </div>
-        <div id="warningsList" class="warning-list"></div>
-      </section>
-    </main>
+      <aside id="nodeDetails" class="inspector-panel" aria-label="Inspector do nó">
+        <h2>Nó selecionado</h2>
+        <p class="muted">Clique em um nó do grafo ou em uma linha da tabela.</p>
+      </aside>
+    </div>
 
     <script src="/app.js"></script>
   </body>

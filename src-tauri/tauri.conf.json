@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "S.R.C A.D.D",
+  "version": "0.1.0",
+  "identifier": "com.russophone.src.add",
+  "build": {
+    "beforeDevCommand": "npm start",
+    "devUrl": "http://127.0.0.1:4173",
+    "frontendDist": "../public"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "S.R.C A.D.D",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 640
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": []
+  }
+}

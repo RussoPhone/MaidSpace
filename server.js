@@ -5,39 +5,57 @@ const { analyzeDirectory, DEFAULT_OPTIONS } = require("./src/add/analyzer");
 
 const rootDirectory = __dirname;
 const publicDirectory = path.join(rootDirectory, "public");
-const port = readPort();
 
-const server = http.createServer(async (request, response) => {
-  try {
-    if (request.method === "GET" && request.url === "/api/health") {
-      return sendJson(response, 200, {
-        ok: true,
-        cwd: rootDirectory,
-        defaultOptions: DEFAULT_OPTIONS
+function createAppServer() {
+  return http.createServer(async (request, response) => {
+    try {
+      if (request.method === "GET" && request.url === "/api/health") {
+        return sendJson(response, 200, {
+          ok: true,
+          cwd: rootDirectory,
+          defaultOptions: DEFAULT_OPTIONS
+        });
+      }
+
+      if (request.method === "POST" && request.url === "/api/scan") {
+        const body = await readJsonBody(request);
+        const result = await analyzeDirectory(body.rootPath || rootDirectory, body.options || {});
+        return sendJson(response, 200, result);
+      }
+
+      if (request.method !== "GET") {
+        return sendJson(response, 405, { error: "Metodo nao suportado." });
+      }
+
+      return serveStatic(request, response);
+    } catch (error) {
+      return sendJson(response, 500, {
+        error: error.message || "Erro inesperado no servidor."
       });
     }
+  });
+}
 
-    if (request.method === "POST" && request.url === "/api/scan") {
-      const body = await readJsonBody(request);
-      const result = await analyzeDirectory(body.rootPath || rootDirectory, body.options || {});
-      return sendJson(response, 200, result);
-    }
-
-    if (request.method !== "GET") {
-      return sendJson(response, 405, { error: "Metodo nao suportado." });
-    }
-
-    return serveStatic(request, response);
-  } catch (error) {
-    return sendJson(response, 500, {
-      error: error.message || "Erro inesperado no servidor."
+function startServer({ port = readPort(), host = "127.0.0.1" } = {}) {
+  const server = createAppServer();
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      const address = server.address();
+      const resolvedPort = typeof address === "object" ? address.port : port;
+      const url = `http://${host}:${resolvedPort}`;
+      console.log(`S.R.C A.D.D rodando em ${url}`);
+      resolve({ server, url, port: resolvedPort, host });
     });
-  }
-});
+  });
+}
 
-server.listen(port, () => {
-  console.log(`S.R.C A.D.D rodando em http://localhost:${port}`);
-});
+if (require.main === module) {
+  startServer({ port: readPort(), host: "127.0.0.1" }).catch((error) => {
+    console.error(error.message || error);
+    process.exitCode = 1;
+  });
+}
 
 function readPort() {
   const portArgIndex = process.argv.indexOf("--port");
@@ -113,3 +131,8 @@ function contentTypeFor(filePath) {
   };
   return types[extension] || "application/octet-stream";
 }
+
+module.exports = {
+  createAppServer,
+  startServer
+};

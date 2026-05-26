@@ -1,5 +1,6 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const { classifyFileKnowledge, loadFileKnowledge } = require("./fileKnowledge");
 
 const TEXT_EXTENSIONS = new Set([
   ".astro",
@@ -48,9 +49,12 @@ const SPECIAL_TEXT_FILES = new Set([
 ]);
 
 const DEFAULT_OPTIONS = {
+  adaptive: true,
   maxFiles: 5000,
   maxDepth: 18,
   maxFileSizeBytes: 512 * 1024,
+  unusedDaysThreshold: loadFileKnowledge().recentUse?.unusedWindowDays || 30,
+  frequentUseDaysThreshold: loadFileKnowledge().recentUse?.frequentWindowDays || 7,
   includeHidden: true,
   skipDirectories: [
     ".git",
@@ -77,8 +81,12 @@ const DEFAULT_OPTIONS = {
     "Program Files",
     "Program Files (x86)",
     "ProgramData",
+    "Recovery",
+    "System32",
     "System Volume Information",
-    "Windows"
+    "Windows",
+    "WindowsApps",
+    "WinSxS"
   ]
 };
 
@@ -129,7 +137,6 @@ const C_EXTENSIONS = [".h", ".hpp", ".c", ".cc", ".cpp"];
 const RUST_EXTENSIONS = [".rs", "/mod.rs"];
 
 async function analyzeDirectory(rootPath, rawOptions = {}) {
-  const options = normalizeOptions(rawOptions);
   const root = path.resolve(rootPath || process.cwd());
   const startedAt = Date.now();
   const warnings = [];
@@ -150,6 +157,8 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
     throw new Error(`O caminho informado nao e um diretorio: ${root}`);
   }
 
+  const scaleEstimate = await estimateDirectoryScale(root);
+  const options = normalizeOptions(rawOptions, scaleEstimate);
   await walkDirectory(root, "", 0);
   const indexes = buildIndexes(fileNodes);
   const edges = [];
@@ -212,10 +221,12 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
 
   const components = buildComponents(fileNodes, edges);
   const depthById = computeDepths(fileNodes);
+  applyComponentMetadata(fileNodes, components);
+  applyImpactMetadata(fileNodes);
 
   for (const node of fileNodes) {
     node.depth = depthById.get(node.id) || 0;
-    classifyNode(node);
+    classifyNode(node, options);
   }
 
   for (const component of components) {
@@ -229,16 +240,19 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
 
   const summary = buildSummary(nodes, fileNodes, edges, components, skipped, warnings, startedAt);
   const simulation = buildSimulation(fileNodes);
+  const graphViews = buildGraphViews(nodes, fileNodes, edges);
 
   return {
     schemaVersion: 1,
     algorithm: "A.D.D",
     rootPath: root,
     options,
+    scaleEstimate,
     summary,
     nodes: nodes.map(stripInternalNodeFields),
     edges,
     components,
+    graphViews,
     simulation,
     skipped,
     warnings
@@ -330,6 +344,7 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
 
       const extension = path.extname(entry.name).toLowerCase();
       const lowerName = entry.name.toLowerCase();
+      const fileKnowledge = classifyFileKnowledge(relativePath, entry.name, extension);
       const canReadContent = isTextCandidate(lowerName, extension) && stat.size <= options.maxFileSizeBytes;
       const node = {
         id: `file:${relativePath}`,
@@ -340,15 +355,30 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
         extension,
         size: stat.size,
         modifiedAt: stat.mtime.toISOString(),
+        lastAccessedAt: stat.atime.toISOString(),
+        daysSinceAccess: daysBetween(stat.atime, new Date()),
         protectedReasons,
+        fileKnowledge,
         incoming: 0,
         outgoing: 0,
         incomingFrom: [],
         outgoingTo: [],
         depth: 0,
+        impactCount: 0,
+        componentId: null,
+        componentSize: 1,
         classification: "isolado",
         risk: "baixo",
         riskScore: 0,
+        riskReasons: [],
+        impact: {
+          system: "desconhecido",
+          user: "desconhecido",
+          dependencies: "desconhecido"
+        },
+        utilityStatus: "desconhecido",
+        deletionDecision: "averiguar",
+        relocationDecision: "pode_mexer",
         simulationAction: "separar_como_isolado",
         canReadContent,
         readError: null,
@@ -374,18 +404,112 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
   }
 }
 
-function normalizeOptions(rawOptions) {
+async function estimateDirectoryScale(root) {
+  const queue = [{ absolutePath: root, depth: 0 }];
+  const visited = new Set();
+  const maxEntries = 1600;
+  let sampledFiles = 0;
+  let sampledDirectories = 0;
+  let maxObservedDepth = 0;
+
+  while (queue.length && sampledFiles + sampledDirectories < maxEntries) {
+    const current = queue.shift();
+    const key = current.absolutePath.toLowerCase();
+    if (visited.has(key) || current.depth > 5) {
+      continue;
+    }
+    visited.add(key);
+    maxObservedDepth = Math.max(maxObservedDepth, current.depth);
+
+    let entries = [];
+    try {
+      entries = await fs.readdir(current.absolutePath, { withFileTypes: true });
+    } catch (error) {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (sampledFiles + sampledDirectories >= maxEntries) {
+        break;
+      }
+      if (entry.isDirectory()) {
+        sampledDirectories += 1;
+        if (!DEFAULT_OPTIONS.skipDirectories.some((name) => name.toLowerCase() === entry.name.toLowerCase())) {
+          queue.push({ absolutePath: path.join(current.absolutePath, entry.name), depth: current.depth + 1 });
+        }
+      } else if (entry.isFile()) {
+        sampledFiles += 1;
+      }
+    }
+  }
+
+  const sampledEntries = sampledFiles + sampledDirectories;
+  const density = Math.max(1, sampledEntries / Math.max(1, visited.size));
+  const estimatedFiles = Math.round(sampledFiles * Math.max(1, density / 8));
+  const scale = sampledEntries >= 1400 || estimatedFiles >= 12000
+    ? "massivo"
+    : sampledEntries >= 700 || estimatedFiles >= 5000
+      ? "grande"
+      : sampledEntries >= 180 || estimatedFiles >= 1200
+        ? "medio"
+        : "pequeno";
+
+  return {
+    scale,
+    sampledFiles,
+    sampledDirectories,
+    sampledEntries,
+    sampledDepth: maxObservedDepth
+  };
+}
+
+function normalizeOptions(rawOptions, scaleEstimate = { scale: "medio" }) {
+  const adaptive = rawOptions.adaptive !== false;
+  const adaptiveDefaults = adaptiveProfile(scaleEstimate.scale);
   const options = {
     ...DEFAULT_OPTIONS,
+    ...(adaptive ? adaptiveDefaults : {}),
     ...rawOptions
   };
 
+  options.adaptive = adaptive;
   options.maxFiles = clampInteger(options.maxFiles, 100, 50000, DEFAULT_OPTIONS.maxFiles);
   options.maxDepth = clampInteger(options.maxDepth, 1, 64, DEFAULT_OPTIONS.maxDepth);
   options.maxFileSizeBytes = clampInteger(options.maxFileSizeBytes, 16 * 1024, 5 * 1024 * 1024, DEFAULT_OPTIONS.maxFileSizeBytes);
+  options.unusedDaysThreshold = clampInteger(options.unusedDaysThreshold, 1, 3650, DEFAULT_OPTIONS.unusedDaysThreshold);
+  options.frequentUseDaysThreshold = clampInteger(options.frequentUseDaysThreshold, 1, 60, DEFAULT_OPTIONS.frequentUseDaysThreshold);
   options.skipDirectories = Array.from(new Set([...(DEFAULT_OPTIONS.skipDirectories || []), ...((rawOptions && rawOptions.skipDirectories) || [])]));
   options.includeHidden = Boolean(options.includeHidden);
   return options;
+}
+
+function adaptiveProfile(scale) {
+  if (scale === "massivo") {
+    return {
+      maxFiles: 15000,
+      maxDepth: 12,
+      maxFileSizeBytes: 128 * 1024
+    };
+  }
+  if (scale === "grande") {
+    return {
+      maxFiles: 10000,
+      maxDepth: 15,
+      maxFileSizeBytes: 256 * 1024
+    };
+  }
+  if (scale === "medio") {
+    return {
+      maxFiles: 7000,
+      maxDepth: 18,
+      maxFileSizeBytes: 512 * 1024
+    };
+  }
+  return {
+    maxFiles: 3000,
+    maxDepth: 24,
+    maxFileSizeBytes: 1024 * 1024
+  };
 }
 
 function clampInteger(value, min, max, fallback) {
@@ -394,6 +518,14 @@ function clampInteger(value, min, max, fallback) {
     return fallback;
   }
   return Math.min(max, Math.max(min, parsed));
+}
+
+function daysBetween(date, now) {
+  const diff = now.getTime() - date.getTime();
+  if (!Number.isFinite(diff) || diff < 0) {
+    return 0;
+  }
+  return Math.floor(diff / 86400000);
 }
 
 function shouldSkipDirectory(name, protectedReasons, options) {
@@ -417,15 +549,23 @@ function getProtectedReasons(absolutePath, relativePath, name) {
     reasons.push("executavel ou biblioteca do sistema");
   }
 
+  const knowledge = classifyFileKnowledge(relativePath, name, extension);
+  if (knowledge.isSystemEssential) {
+    reasons.push("tipo essencial do sistema");
+  }
+  if (knowledge.isProjectDependency) {
+    reasons.push("dependencia/configuracao de projeto");
+  }
+
   if (/(^|[\\/])(\.git|\.hg|\.svn)([\\/]|$)/i.test(absolutePath)) {
     reasons.push("metadados de versionamento");
   }
 
-  if (/(^|[\\/])(windows|program files|program files \(x86\)|programdata|system volume information|\$recycle\.bin)([\\/]|$)/i.test(absolutePath)) {
+  if (/(^|[\\/])(windows|system32|winsxs|windowsapps|program files|program files \(x86\)|programdata|recovery|system volume information|\$recycle\.bin)([\\/]|$)/i.test(absolutePath)) {
     reasons.push("diretorio do sistema operacional");
   }
 
-  if (/(^|\/)(windows|program files|program files \(x86\)|programdata|system volume information|\$recycle\.bin)(\/|$)/i.test(lowerRelative)) {
+  if (/(^|\/)(windows|system32|winsxs|windowsapps|program files|program files \(x86\)|programdata|recovery|system volume information|\$recycle\.bin)(\/|$)/i.test(lowerRelative)) {
     reasons.push("diretorio do sistema operacional");
   }
 
@@ -786,6 +926,42 @@ function buildComponents(fileNodes, edges) {
   return components.sort((a, b) => b.nodeCount - a.nodeCount);
 }
 
+function applyComponentMetadata(fileNodes, components) {
+  const byId = new Map(fileNodes.map((node) => [node.id, node]));
+  for (const component of components) {
+    for (const nodeId of component.nodeIds) {
+      const node = byId.get(nodeId);
+      if (node) {
+        node.componentId = component.id;
+        node.componentSize = component.nodeCount;
+      }
+    }
+  }
+}
+
+function applyImpactMetadata(fileNodes) {
+  const byId = new Map(fileNodes.map((node) => [node.id, node]));
+
+  for (const node of fileNodes) {
+    const impacted = new Set();
+    const queue = [...node.incomingFrom];
+
+    while (queue.length) {
+      const currentId = queue.shift();
+      if (impacted.has(currentId)) {
+        continue;
+      }
+      impacted.add(currentId);
+      const current = byId.get(currentId);
+      if (current) {
+        queue.push(...current.incomingFrom);
+      }
+    }
+
+    node.impactCount = impacted.size;
+  }
+}
+
 function computeDepths(fileNodes) {
   const byId = new Map(fileNodes.map((node) => [node.id, node]));
   const memo = new Map();
@@ -816,9 +992,18 @@ function computeDepths(fileNodes) {
   return memo;
 }
 
-function classifyNode(node) {
+function classifyNode(node, options = DEFAULT_OPTIONS) {
   const reasons = [...node.protectedReasons];
   let riskScore = 0;
+  const knowledge = node.fileKnowledge || {};
+  const isSystemProtected = node.protectedReasons.some((reason) => reason.includes("sistema") || reason.includes("executavel") || reason.includes("biblioteca"));
+  const isConfigProtected = node.protectedReasons.length > 0;
+  const dependencyLoad = node.incoming + node.outgoing + node.impactCount;
+  const isUnused = node.daysSinceAccess >= options.unusedDaysThreshold;
+  const isFrequentlyUsed = node.daysSinceAccess <= options.frequentUseDaysThreshold;
+  const isLowValueGenerated = Boolean(knowledge.isLowValueGenerated);
+  const isUserContent = Boolean(knowledge.isUserContent);
+  const dependencyImpact = dependencyImpactFor(node);
 
   if (reasons.length) {
     riskScore += 80;
@@ -826,61 +1011,248 @@ function classifyNode(node) {
   riskScore += node.incoming * 12;
   riskScore += node.outgoing * 4;
   riskScore += node.depth * 6;
+  riskScore += Math.min(80, node.impactCount * 10);
+  riskScore += Math.min(30, Math.max(0, node.componentSize - 1) * 3);
   riskScore += node.unresolvedDependencies * 15;
+  if (node.daysSinceAccess <= 1) {
+    riskScore += 24;
+    reasons.push("uso muito recente");
+  } else if (node.daysSinceAccess <= 4) {
+    riskScore += 14;
+    reasons.push("uso recente");
+  } else if (node.daysSinceAccess <= 10) {
+    riskScore += 7;
+    reasons.push("uso na ultima semana");
+  } else if (node.daysSinceAccess >= 60 && node.incoming === 0) {
+    riskScore -= 5;
+    reasons.push("sem uso recente detectado");
+  }
   if (node.size > 1024 * 1024) {
     riskScore += 10;
+    reasons.push("arquivo grande");
+  }
+  if (node.incoming > 0) {
+    reasons.push(`${node.incoming} dependencia(s) apontam para este arquivo`);
+  }
+  if (node.outgoing > 0) {
+    reasons.push(`${node.outgoing} dependencia(s) usadas por este arquivo`);
+  }
+  if (node.impactCount > 0) {
+    reasons.push(`${node.impactCount} arquivo(s) seriam afetados transitivamente`);
+  }
+  if (node.unresolvedDependencies > 0) {
+    reasons.push("dependencias nao resolvidas");
+  }
+  if (isLowValueGenerated) {
+    reasons.push("tipo gerado/cache de baixo valor");
+    riskScore -= 14;
+  }
+  if (isUserContent && isFrequentlyUsed) {
+    reasons.push("conteudo do usuario usado nos ultimos 7 dias");
   }
 
   if (node.protectedReasons.length) {
     node.classification = "critico_protegido";
     node.risk = "alto";
     node.simulationAction = "proteger_nao_mover";
+    node.relocationDecision = "nao_mover";
   } else if (node.incoming === 0 && node.outgoing === 0 && node.unresolvedDependencies === 0) {
     node.classification = "isolado";
-    node.risk = "baixo";
-    node.simulationAction = "separar_como_isolado";
+    node.risk = riskScore >= 30 ? "medio" : "baixo";
+    node.simulationAction = node.risk === "baixo" ? "candidato_para_realocacao" : "revisar_uso_recente";
+    node.relocationDecision = node.risk === "baixo" ? "pode_mexer" : "averiguar";
   } else if (node.incoming > 0 && node.outgoing > 0) {
     node.classification = "dependente_provedor";
-    node.risk = riskScore >= 55 ? "alto" : "medio";
-    node.simulationAction = "revisar_com_grafo";
+    node.risk = riskScore >= 65 || node.impactCount >= 6 ? "alto" : "medio";
+    node.simulationAction = "revisar_dependencias";
+    node.relocationDecision = node.risk === "alto" ? "nao_mover" : "averiguar";
   } else if (node.incoming > 0) {
     node.classification = "provedor";
-    node.risk = node.incoming >= 4 || riskScore >= 55 ? "alto" : "medio";
-    node.simulationAction = "manter_com_dependentes";
+    node.risk = node.incoming >= 4 || node.impactCount >= 8 || riskScore >= 60 ? "alto" : "medio";
+    node.simulationAction = node.risk === "alto" ? "nao_mover" : "revisar_antes_de_mover";
+    node.relocationDecision = node.risk === "alto" ? "nao_mover" : "averiguar";
   } else if (node.outgoing > 0) {
     node.classification = "dependente";
     node.risk = node.unresolvedDependencies > 0 || riskScore >= 45 ? "medio" : "baixo";
-    node.simulationAction = "pode_mover_com_fornecedores";
+    node.simulationAction = node.risk === "baixo" ? "mover_com_dependencias" : "revisar_antes_de_mover";
+    node.relocationDecision = node.risk === "baixo" ? "pode_mexer" : "averiguar";
   } else {
     node.classification = "dependente";
     node.risk = "medio";
     node.simulationAction = "revisar_dependencias_nao_resolvidas";
+    node.relocationDecision = "averiguar";
   }
 
   if (node.unresolvedDependencies > 0 && node.risk === "baixo") {
     node.risk = "medio";
+    node.relocationDecision = "averiguar";
+  }
+
+  node.impact = {
+    system: isSystemProtected ? "afeta_sistema" : isConfigProtected ? "protegido" : "nao_afeta_sistema",
+    user: userImpactFor(node, { isFrequentlyUsed, isUnused }),
+    dependencies: dependencyImpact
+  };
+  node.utilityStatus = utilityStatusFor(node, {
+    isSystemProtected,
+    isConfigProtected,
+    isUnused,
+    isFrequentlyUsed,
+    isLowValueGenerated,
+    isUserContent,
+    dependencyImpact
+  });
+  node.deletionDecision = deletionDecisionFor(node, {
+    isSystemProtected,
+    isConfigProtected,
+    isUnused,
+    isFrequentlyUsed,
+    isLowValueGenerated,
+    isUserContent,
+    dependencyImpact,
+    dependencyLoad
+  });
+
+  if (node.deletionDecision === "pode_apagar" || node.deletionDecision === "inutil_provavel") {
+    node.relocationDecision = "pode_mexer";
+  } else if (node.deletionDecision === "nao_apagar") {
+    node.relocationDecision = "nao_mover";
+  } else {
+    node.relocationDecision = "averiguar";
   }
 
   node.riskScore = riskScore;
+  node.riskReasons = Array.from(new Set(reasons)).slice(0, 8);
+}
+
+function dependencyImpactFor(node) {
+  if (node.unresolvedDependencies > 0) {
+    return "incerto";
+  }
+  if (node.fileKnowledge?.isLowValueGenerated && node.incoming === 0 && node.impactCount === 0) {
+    return node.outgoing > 0 ? "baixo" : "nenhum";
+  }
+  if (node.impactCount >= 8 || node.incoming >= 4 || node.componentSize >= 12) {
+    return "alto";
+  }
+  if (node.impactCount >= 2 || node.incoming >= 2 || node.componentSize >= 5) {
+    return "medio";
+  }
+  if (node.incoming > 0 || node.outgoing > 0 || node.impactCount > 0) {
+    return "baixo";
+  }
+  return "nenhum";
+}
+
+function userImpactFor(node, { isFrequentlyUsed, isUnused }) {
+  if (node.protectedReasons.length > 0) {
+    return "alto";
+  }
+  if (isFrequentlyUsed && node.fileKnowledge?.isUserContent) {
+    return "alto";
+  }
+  if (isFrequentlyUsed && !node.fileKnowledge?.isLowValueGenerated) {
+    return "medio";
+  }
+  if (node.daysSinceAccess <= 10 || node.incoming >= 2 || node.impactCount >= 2) {
+    return "medio";
+  }
+  if (isUnused && node.incoming === 0 && node.impactCount === 0) {
+    return "baixo";
+  }
+  return "baixo";
+}
+
+function utilityStatusFor(node, context) {
+  if (context.isSystemProtected) {
+    return "sistema";
+  }
+  if (context.isConfigProtected) {
+    return "protegido";
+  }
+  if (context.isLowValueGenerated && node.incoming === 0 && node.impactCount === 0 && node.unresolvedDependencies === 0) {
+    return context.isUnused ? "inutil_provavel" : "baixo_uso";
+  }
+  if (context.isFrequentlyUsed && context.isUserContent) {
+    return "usado_pelo_usuario";
+  }
+  if (context.dependencyImpact === "alto" || context.dependencyImpact === "medio") {
+    return "dependencia_relevante";
+  }
+  if (context.isUnused && node.incoming === 0 && node.outgoing === 0 && node.impactCount === 0 && node.unresolvedDependencies === 0) {
+    return "inutil_provavel";
+  }
+  if (context.isUnused && node.impactCount === 0 && node.unresolvedDependencies === 0) {
+    return "baixo_uso";
+  }
+  return "utilidade_incerta";
+}
+
+function deletionDecisionFor(node, context) {
+  if (context.isSystemProtected || context.isConfigProtected) {
+    return "nao_apagar";
+  }
+  if (context.isLowValueGenerated && node.incoming === 0 && node.impactCount === 0 && node.unresolvedDependencies === 0) {
+    return context.isUnused ? "pode_apagar" : "inutil_provavel";
+  }
+  if (context.isFrequentlyUsed && context.isUserContent) {
+    return "nao_apagar";
+  }
+  if (context.dependencyImpact === "alto") {
+    return "nao_apagar";
+  }
+  if (node.unresolvedDependencies > 0 || context.dependencyImpact === "incerto") {
+    return "averiguar";
+  }
+  if (context.dependencyImpact === "medio") {
+    return "averiguar";
+  }
+  if (context.isUnused && node.incoming === 0 && node.outgoing === 0 && node.impactCount === 0) {
+    return "pode_apagar";
+  }
+  if (context.isUnused && node.impactCount === 0 && context.dependencyLoad <= 2) {
+    return "inutil_provavel";
+  }
+  return "averiguar";
 }
 
 function buildSummary(nodes, fileNodes, edges, components, skipped, warnings, startedAt) {
   const byClassification = countBy(fileNodes, "classification");
   const byRisk = countBy(fileNodes, "risk");
+  const byDeletionDecision = countBy(fileNodes, "deletionDecision");
+  const byUtilityStatus = countBy(fileNodes, "utilityStatus");
+  const directories = nodes.filter((node) => node.kind === "directory").length;
   return {
     scannedAt: new Date().toISOString(),
     elapsedMs: Date.now() - startedAt,
-    directories: nodes.filter((node) => node.kind === "directory").length,
+    directories,
     files: fileNodes.length,
+    entries: directories + fileNodes.length,
     edges: edges.length,
     components: components.length,
     skipped: skipped.length,
     warnings: warnings.length,
     byClassification,
     byRisk,
+    byDeletionDecision,
+    byUtilityStatus,
+    byKnowledge: {
+      systemEssential: fileNodes.filter((node) => node.fileKnowledge?.isSystemEssential).length,
+      projectDependency: fileNodes.filter((node) => node.fileKnowledge?.isProjectDependency).length,
+      userContent: fileNodes.filter((node) => node.fileKnowledge?.isUserContent).length,
+      lowValueGenerated: fileNodes.filter((node) => node.fileKnowledge?.isLowValueGenerated).length,
+      usedLast7Days: fileNodes.filter((node) => node.daysSinceAccess <= 7).length
+    },
     candidateLowRisk: fileNodes.filter((node) => node.risk === "baixo" && node.classification === "isolado").length,
+    canDelete: fileNodes.filter((node) => node.deletionDecision === "pode_apagar").length,
+    probablyUseless: fileNodes.filter((node) => node.utilityStatus === "inutil_provavel" || node.deletionDecision === "inutil_provavel").length,
+    mustKeep: fileNodes.filter((node) => node.deletionDecision === "nao_apagar").length,
     protected: fileNodes.filter((node) => node.classification === "critico_protegido").length,
-    unresolvedDependencies: fileNodes.reduce((sum, node) => sum + node.unresolvedDependencies, 0)
+    unresolvedDependencies: fileNodes.reduce((sum, node) => sum + node.unresolvedDependencies, 0),
+    recentlyAccessed: fileNodes.filter((node) => node.daysSinceAccess <= 4).length,
+    staleCandidates: fileNodes.filter((node) => node.daysSinceAccess >= 30 && node.incoming === 0 && node.risk === "baixo").length,
+    highImpactProviders: fileNodes.filter((node) => node.impactCount >= 6 || node.incoming >= 4).length,
+    totalTransitiveImpact: fileNodes.reduce((sum, node) => sum + node.impactCount, 0)
   };
 }
 
@@ -920,14 +1292,379 @@ function buildSimulation(fileNodes) {
     }
   }
 
+  const decisionGroups = {
+    pode_apagar: fileNodes
+      .filter((node) => node.deletionDecision === "pode_apagar")
+      .map(toSimulationDecision),
+    inutil_provavel: fileNodes
+      .filter((node) => node.deletionDecision === "inutil_provavel")
+      .map(toSimulationDecision),
+    averiguar: fileNodes
+      .filter((node) => node.deletionDecision === "averiguar")
+      .map(toSimulationDecision),
+    nao_apagar: fileNodes
+      .filter((node) => node.deletionDecision === "nao_apagar")
+      .map(toSimulationDecision)
+  };
+
   return {
     buckets,
+    decisionGroups,
     recommendation: {
-      baixo: "Arquivos isolados e sem pendencias detectadas podem ser candidatos para separacao.",
-      medio: "Arquivos dependentes exigem mover junto com fornecedores ou revisar imports nao resolvidos.",
-      alto: "Arquivos protegidos, provedores fortes ou com grande profundidade nao devem ser alterados pelo A.R.E sem revisao."
+      pode_apagar: "Nao afeta sistema, nao afeta dependencias relevantes e parece fora de uso.",
+      inutil_provavel: "Baixo uso e baixo impacto; bom candidato para A.R.E, mas ainda merece confirmacao.",
+      averiguar: "Ha uso, dependencia ou incerteza suficiente para pedir revisao.",
+      nao_apagar: "Afeta sistema, usuario recente ou dependencia relevante; tratar como protegido."
     }
   };
+}
+
+function toSimulationDecision(node) {
+  return {
+    id: node.id,
+    path: node.relativePath,
+    risk: node.risk,
+    utilityStatus: node.utilityStatus,
+    deletionDecision: node.deletionDecision,
+    impact: node.impact,
+    knowledgeCategories: node.fileKnowledge?.categories || [],
+    action: node.simulationAction,
+    reason: simulationReason(node),
+    incoming: node.incoming,
+    outgoing: node.outgoing,
+    impactCount: node.impactCount,
+    riskScore: node.riskScore,
+    riskReasons: node.riskReasons,
+    daysSinceAccess: node.daysSinceAccess
+  };
+}
+
+function simulationReason(node) {
+  if (node.protectedReasons.length) {
+    return node.protectedReasons.join(", ");
+  }
+  if (node.deletionDecision === "pode_apagar") {
+    return "sem uso recente, sem dependencia e fora de area protegida";
+  }
+  if (node.deletionDecision === "inutil_provavel") {
+    return "baixo uso e impacto pequeno no grafo";
+  }
+  if (node.incoming >= 4) {
+    return "muitas dependencias apontam para este arquivo";
+  }
+  if (node.impactCount >= 6) {
+    return "impacto transitivo alto no grafo";
+  }
+  if (node.daysSinceAccess <= 4) {
+    return "uso recente detectado";
+  }
+  if (node.unresolvedDependencies > 0) {
+    return "ha dependencias nao resolvidas";
+  }
+  if (node.incoming === 0 && node.outgoing === 0) {
+    return "isolado no grafo local";
+  }
+  return "impacto limitado, mas conectado ao grafo";
+}
+
+function buildGraphViews(nodes, fileNodes, edges) {
+  return {
+    far: buildDirectoryGraph(nodes, fileNodes, edges),
+    medium: buildGroupedGraph(fileNodes, edges),
+    close: {
+      mode: "proximo",
+      description: "arquivos individuais",
+      nodes: fileNodes.map(toCloseGraphNode),
+      edges: edges.map((edge) => ({
+        ...edge,
+        weight: 1,
+        label: edge.type
+      }))
+    }
+  };
+}
+
+function buildDirectoryGraph(nodes, fileNodes, edges) {
+  const directoryNodes = nodes.filter((node) => node.kind === "directory");
+  const directoryCounts = countDirectoriesByTopLevel(directoryNodes);
+  const groups = new Map();
+
+  for (const file of fileNodes) {
+    const directory = topDirectory(file.relativePath);
+    if (!groups.has(directory)) {
+      groups.set(directory, []);
+    }
+    groups.get(directory).push(file);
+  }
+
+  const viewNodes = Array.from(groups.entries()).map(([directory, files]) => {
+    const incoming = files.reduce((sum, file) => sum + file.incoming, 0);
+    const outgoing = files.reduce((sum, file) => sum + file.outgoing, 0);
+    return {
+      id: `far:${directory}`,
+      kind: "directory_group",
+      label: directory,
+      relativePath: directory,
+      risk: maxRisk(files),
+      classification: "diretorio",
+      fileCount: files.length,
+      directoryCount: directoryCounts.get(directory) || 0,
+      incoming,
+      outgoing,
+      impactCount: files.reduce((sum, file) => sum + file.impactCount, 0),
+      deletionDecision: aggregateDeletionDecision(files),
+      utilityStatus: aggregateUtilityStatus(files),
+      depth: Math.max(0, ...files.map((file) => file.depth)),
+      size: files.reduce((sum, file) => sum + file.size, 0),
+      children: files.map((file) => file.id),
+      groupReason: "diretorio agregado por dependencias"
+    };
+  });
+
+  const nodeForFile = new Map();
+  for (const file of fileNodes) {
+    nodeForFile.set(file.id, `far:${topDirectory(file.relativePath)}`);
+  }
+
+  return {
+    mode: "distante",
+    description: "diretorios agregados",
+    nodes: viewNodes,
+    edges: aggregateGraphEdges(edges, nodeForFile)
+  };
+}
+
+function buildGroupedGraph(fileNodes, edges) {
+  const edgeTargetsBySource = new Map(fileNodes.map((node) => [node.id, []]));
+  for (const edge of edges) {
+    edgeTargetsBySource.get(edge.source)?.push(edge.target);
+  }
+
+  const groups = new Map();
+  for (const file of fileNodes) {
+    const key = mediumGroupKey(file, edgeTargetsBySource);
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(file);
+  }
+
+  const nodeForFile = new Map();
+  const viewNodes = [];
+  let groupIndex = 0;
+
+  for (const [key, files] of groups.entries()) {
+    const forceIndividual = files.length === 1;
+    if (forceIndividual) {
+      const node = toCloseGraphNode(files[0]);
+      node.id = `medium:file:${files[0].relativePath}`;
+      node.kind = "important_file";
+      node.groupReason = "arquivo principal";
+      nodeForFile.set(files[0].id, node.id);
+      viewNodes.push(node);
+      continue;
+    }
+
+    groupIndex += 1;
+    const first = files[0];
+    const extension = first.extension || "sem_ext";
+    const groupReason = key.startsWith("shared:")
+      ? "arquivos com dependencias em comum"
+      : "arquivos agrupados por pasta, tipo e risco";
+    const label = key.startsWith("shared:")
+      ? `${files.length} arquivos dependentes`
+      : `${files.length} ${extension} em ${topDirectory(first.relativePath)}`;
+    const id = `medium:group:${groupIndex}`;
+    for (const file of files) {
+      nodeForFile.set(file.id, id);
+    }
+    viewNodes.push({
+      id,
+      kind: "dependency_group",
+      label,
+      relativePath: topDirectory(first.relativePath),
+      risk: maxRisk(files),
+      classification: commonClassification(files),
+      fileCount: files.length,
+      directoryCount: new Set(files.map((file) => topDirectory(file.relativePath))).size,
+      incoming: files.reduce((sum, file) => sum + file.incoming, 0),
+      outgoing: files.reduce((sum, file) => sum + file.outgoing, 0),
+      impactCount: files.reduce((sum, file) => sum + file.impactCount, 0),
+      deletionDecision: aggregateDeletionDecision(files),
+      utilityStatus: aggregateUtilityStatus(files),
+      depth: Math.max(0, ...files.map((file) => file.depth)),
+      size: files.reduce((sum, file) => sum + file.size, 0),
+      children: files.map((file) => file.id),
+      groupReason
+    });
+  }
+
+  return {
+    mode: "medio",
+    description: "arquivos principais e grupos de dependencia",
+    nodes: viewNodes,
+    edges: aggregateGraphEdges(edges, nodeForFile)
+  };
+}
+
+function toCloseGraphNode(node) {
+  return {
+    id: node.id,
+    kind: "file",
+    label: node.name,
+    name: node.name,
+    relativePath: node.relativePath,
+    extension: node.extension,
+    risk: node.risk,
+    classification: node.classification,
+    fileCount: 1,
+    directoryCount: 0,
+    incoming: node.incoming,
+    outgoing: node.outgoing,
+    impactCount: node.impactCount,
+    depth: node.depth,
+    size: node.size,
+    daysSinceAccess: node.daysSinceAccess,
+    action: node.simulationAction,
+    deletionDecision: node.deletionDecision,
+    utilityStatus: node.utilityStatus,
+    impact: node.impact,
+    knowledgeCategories: node.fileKnowledge?.categories || [],
+    relocationDecision: node.relocationDecision,
+    riskScore: node.riskScore,
+    riskReasons: node.riskReasons,
+    children: [node.id],
+    groupReason: "arquivo individual"
+  };
+}
+
+function aggregateGraphEdges(edges, nodeForFile) {
+  const aggregate = new Map();
+
+  for (const edge of edges) {
+    const source = nodeForFile.get(edge.source);
+    const target = nodeForFile.get(edge.target);
+    if (!source || !target || source === target) {
+      continue;
+    }
+    const key = `${source}->${target}`;
+    if (!aggregate.has(key)) {
+      aggregate.set(key, {
+        id: key,
+        source,
+        target,
+        weight: 0,
+        types: {},
+        samples: []
+      });
+    }
+    const item = aggregate.get(key);
+    item.weight += 1;
+    item.types[edge.type] = (item.types[edge.type] || 0) + 1;
+    if (item.samples.length < 4) {
+      item.samples.push({
+        sourcePath: edge.sourcePath,
+        targetPath: edge.targetPath,
+        type: edge.type
+      });
+    }
+  }
+
+  return Array.from(aggregate.values()).map((edge) => ({
+    ...edge,
+    label: Object.entries(edge.types)
+      .sort((a, b) => b[1] - a[1])
+      .map(([type, count]) => `${type}:${count}`)
+      .join(", ")
+  }));
+}
+
+function mediumGroupKey(file, edgeTargetsBySource) {
+  const degree = file.incoming + file.outgoing;
+  if (file.risk === "alto" || file.classification === "critico_protegido" || degree >= 4) {
+    return `single:${file.id}`;
+  }
+
+  const targets = (edgeTargetsBySource.get(file.id) || []).slice().sort();
+  if (targets.length) {
+    return `shared:${targets.slice(0, 5).join("|")}`;
+  }
+
+  return `kind:${topDirectory(file.relativePath)}:${file.extension || "sem_ext"}:${file.risk}:${file.classification}`;
+}
+
+function countDirectoriesByTopLevel(directoryNodes) {
+  const counts = new Map();
+  for (const node of directoryNodes) {
+    const top = topDirectory(node.relativePath);
+    counts.set(top, (counts.get(top) || 0) + 1);
+  }
+  return counts;
+}
+
+function topDirectory(relativePath) {
+  const normalized = normalizeRelative(relativePath);
+  if (!normalized || normalized === "." || !normalized.includes("/")) {
+    return ".";
+  }
+  return normalized.split("/")[0];
+}
+
+function maxRisk(files) {
+  if (files.some((file) => file.risk === "alto")) {
+    return "alto";
+  }
+  if (files.some((file) => file.risk === "medio")) {
+    return "medio";
+  }
+  return "baixo";
+}
+
+function commonClassification(files) {
+  const classifications = new Set(files.map((file) => file.classification));
+  if (classifications.size === 1) {
+    return files[0].classification;
+  }
+  if (classifications.has("critico_protegido")) {
+    return "critico_protegido";
+  }
+  return "dependente_provedor";
+}
+
+function aggregateDeletionDecision(files) {
+  if (files.some((file) => file.deletionDecision === "nao_apagar")) {
+    return "nao_apagar";
+  }
+  if (files.some((file) => file.deletionDecision === "averiguar")) {
+    return "averiguar";
+  }
+  if (files.some((file) => file.deletionDecision === "inutil_provavel")) {
+    return "inutil_provavel";
+  }
+  return "pode_apagar";
+}
+
+function aggregateUtilityStatus(files) {
+  const statuses = new Set(files.map((file) => file.utilityStatus));
+  if (statuses.has("sistema")) {
+    return "sistema";
+  }
+  if (statuses.has("protegido")) {
+    return "protegido";
+  }
+  if (statuses.has("dependencia_relevante")) {
+    return "dependencia_relevante";
+  }
+  if (statuses.has("usado_pelo_usuario")) {
+    return "usado_pelo_usuario";
+  }
+  if (statuses.has("utilidade_incerta")) {
+    return "utilidade_incerta";
+  }
+  if (statuses.has("baixo_uso")) {
+    return "baixo_uso";
+  }
+  return "inutil_provavel";
 }
 
 function countBy(items, field) {

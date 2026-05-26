@@ -4,7 +4,11 @@
   "private": true,
   "description": "MVP do Sistema de Relocacao Continua com foco no Algoritmo Determinacao Dependencia.",
   "scripts": {
+    "core:check": "cargo check --manifest-path src-core/add-core/Cargo.toml",
+    "core:run": "cargo run --manifest-path src-core/add-core/Cargo.toml --",
+    "desktop": "node src/desktop/launcher.js",
     "start": "node server.js",
+    "tauri:dev": "npx tauri dev",
     "test": "node --test"
   },
   "engines": {

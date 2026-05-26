@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "description": "Base local do A.D.D para classificar tipos de arquivo por risco, utilidade e relacao com o sistema.",
+  "systemEssential": {
+    "names": [
+      "boot.ini",
+      "bcd",
+      "ntldr",
+      "ntdetect.com",
+      "pagefile.sys",
+      "hiberfil.sys",
+      "swapfile.sys",
+      "hosts",
+      "sam",
+      "system",
+      "software",
+      "security",
+      "default",
+      "user.dat",
+      "ntuser.dat"
+    ],
+    "extensions": [
+      ".sys",
+      ".dll",
+      ".drv",
+      ".ocx",
+      ".efi",
+      ".mui",
+      ".cpl",
+      ".scr",
+      ".lnk",
+      ".reg",
+      ".msi",
+      ".msp"
+    ],
+    "pathFragments": [
+      "windows/",
+      "windows/system32/",
+      "windows/syswow64/",
+      "windows/winsxs/",
+      "windows/servicing/",
+      "program files/",
+      "program files (x86)/",
+      "programdata/microsoft/",
+      "system volume information/",
+      "$recycle.bin/"
+    ]
+  },
+  "projectDependency": {
+    "names": [
+      "package.json",
+      "package-lock.json",
+      "pnpm-lock.yaml",
+      "yarn.lock",
+      "cargo.toml",
+      "cargo.lock",
+      "pyproject.toml",
+      "requirements.txt",
+      "poetry.lock",
+      "go.mod",
+      "go.sum",
+      "pom.xml",
+      "build.gradle",
+      "settings.gradle",
+      "composer.json",
+      "composer.lock",
+      "tsconfig.json",
+      "vite.config.js",
+      "vite.config.ts",
+      "webpack.config.js",
+      "dockerfile",
+      "docker-compose.yml"
+    ],
+    "extensions": [
+      ".json",
+      ".toml",
+      ".lock",
+      ".yaml",
+      ".yml",
+      ".gradle",
+      ".csproj",
+      ".sln",
+      ".vcxproj"
+    ],
+    "pathFragments": [
+      ".git/",
+      ".svn/",
+      ".hg/",
+      "node_modules/",
+      "vendor/",
+      ".venv/",
+      "venv/",
+      "target/",
+      "obj/",
+      "bin/"
+    ]
+  },
+  "userContent": {
+    "extensions": [
+      ".doc",
+      ".docx",
+      ".xls",
+      ".xlsx",
+      ".ppt",
+      ".pptx",
+      ".pdf",
+      ".txt",
+      ".md",
+      ".rtf",
+      ".csv",
+      ".tsv",
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".gif",
+      ".webp",
+      ".svg",
+      ".psd",
+      ".ai",
+      ".mp3",
+      ".wav",
+      ".flac",
+      ".mp4",
+      ".mov",
+      ".mkv",
+      ".zip",
+      ".7z",
+      ".rar"
+    ],
+    "pathFragments": [
+      "desktop/",
+      "documents/",
+      "downloads/",
+      "pictures/",
+      "videos/",
+      "music/"
+    ]
+  },
+  "lowValueGenerated": {
+    "names": [
+      "thumbs.db",
+      "desktop.ini",
+      ".ds_store",
+      "npm-debug.log",
+      "yarn-error.log"
+    ],
+    "extensions": [
+      ".tmp",
+      ".temp",
+      ".log",
+      ".bak",
+      ".old",
+      ".cache",
+      ".dmp",
+      ".chk",
+      ".crdownload",
+      ".part"
+    ],
+    "pathFragments": [
+      "temp/",
+      "tmp/",
+      "cache/",
+      ".cache/",
+      "logs/",
+      "coverage/",
+      ".pytest_cache/",
+      "__pycache__/",
+      ".turbo/",
+      ".next/cache/",
+      "appdata/local/temp/"
+    ]
+  },
+  "recentUse": {
+    "frequentWindowDays": 7,
+    "unusedWindowDays": 30,
+    "note": "O A.D.D usa o ultimo acesso do sistema de arquivos quando disponivel; se o Windows nao mantiver atime atualizado, a classificacao cai para averiguar em vez de apagar."
+  }
+}
