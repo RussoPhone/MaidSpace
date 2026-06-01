@@ -8,25 +8,37 @@ const state = {
   hoveredNodeId: null,
   expandedGroups: new Set(),
   zoom: 1,
-  graphMode: "medium"
+  graphMode: "medium",
+  scanProgressTimer: null,
+  scanProgressStartedAt: 0,
+  scanProgressPercent: 0
 };
 
 const labels = {
   isolado: "isolado",
-  dependente: "dependente",
-  provedor: "provedor",
-  dependente_provedor: "dependente/provedor",
+  dicente: "dicente",
+  docente: "docente",
+  misto: "misto",
+  dependente: "dicente",
+  provedor: "docente",
+  dependente_provedor: "misto",
   critico_protegido: "crítico/protegido",
   diretorio: "diretório"
+  ,
+  critico_protegido: "critico/protegido",
+  diretorio: "diretorio",
+  bloco_interdependente: "bloco interdependente"
 };
 
 const riskColors = {
   baixo: "#2f8f57",
   medio: "#d7a02c",
-  alto: "#c84444"
+  alto: "#c84444",
+  critico: "#7f1d1d"
 };
 
 const riskWeight = {
+  critico: 4,
   alto: 3,
   medio: 2,
   baixo: 1
@@ -63,10 +75,15 @@ const elements = {
   serverStatus: document.querySelector("#serverStatus"),
   rootPath: document.querySelector("#rootPath"),
   adaptiveScan: document.querySelector("#adaptiveScan"),
+  saveState: document.querySelector("#saveState"),
   maxFiles: document.querySelector("#maxFiles"),
   maxDepth: document.querySelector("#maxDepth"),
   maxFileSize: document.querySelector("#maxFileSize"),
   scanButton: document.querySelector("#scanButton"),
+  scanProgress: document.querySelector("#scanProgress"),
+  progressLabel: document.querySelector("#progressLabel"),
+  progressElapsed: document.querySelector("#progressElapsed"),
+  progressBar: document.querySelector("#progressBar"),
   exportButton: document.querySelector("#exportButton"),
   metrics: document.querySelector("#metrics"),
   graphCanvas: document.querySelector("#graphCanvas"),
@@ -80,7 +97,15 @@ const elements = {
   fileSearch: document.querySelector("#fileSearch"),
   filesTable: document.querySelector("#filesTable"),
   simulationGrid: document.querySelector("#simulationGrid"),
+  areSummary: document.querySelector("#areSummary"),
+  openAreModal: document.querySelector("#openAreModal"),
+  closeAreModal: document.querySelector("#closeAreModal"),
+  areModal: document.querySelector("#areModal"),
+  areModalBody: document.querySelector("#areModalBody"),
+  continuousState: document.querySelector("#continuousState"),
   dependenciesTable: document.querySelector("#dependenciesTable"),
+  cyclesList: document.querySelector("#cyclesList"),
+  textReport: document.querySelector("#textReport"),
   warningsList: document.querySelector("#warningsList")
 };
 
@@ -126,6 +151,14 @@ function bindEvents() {
   elements.modeFar?.addEventListener("click", () => setGraphMode("far"));
   elements.modeMedium?.addEventListener("click", () => setGraphMode("medium"));
   elements.modeClose?.addEventListener("click", () => setGraphMode("close"));
+  elements.openAreModal?.addEventListener("click", openAreModal);
+  elements.closeAreModal?.addEventListener("click", closeAreModal);
+  elements.areModal?.querySelector("[data-close-modal='are']")?.addEventListener("click", closeAreModal);
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && elements.areModal && !elements.areModal.classList.contains("is-hidden")) {
+      closeAreModal();
+    }
+  });
 
   document.querySelectorAll(".tab").forEach((button) => {
     button.addEventListener("click", () => {
@@ -187,10 +220,12 @@ async function runScan() {
         maxDepth: Number(elements.maxDepth.value),
         maxFileSizeBytes: Number(elements.maxFileSize.value)
       };
+  options.saveState = elements.saveState?.checked !== false;
 
   elements.scanButton.disabled = true;
   elements.exportButton.disabled = true;
   setStatus("escaneando", "busy");
+  startScanProgress();
 
   try {
     state.result = await fetchJson("/api/scan", {
@@ -201,10 +236,12 @@ async function runScan() {
     state.selectedNodeId = null;
     elements.exportButton.disabled = false;
     syncOptionsFromResult();
-    setStatus(`ok · ${state.result.summary.elapsedMs} ms`, "ok");
+    setStatus(`ok - ${state.result.summary.elapsedMs} ms`, "ok");
+    finishScanProgress("ok", state.result);
     renderAll();
   } catch (error) {
     setStatus("erro na varredura", "error");
+    finishScanProgress("error");
     renderError(error.message);
   } finally {
     elements.scanButton.disabled = false;
@@ -234,11 +271,84 @@ function setStatus(text, mode) {
   elements.serverStatus.dataset.mode = mode;
 }
 
+function startScanProgress() {
+  if (!elements.scanProgress) {
+    return;
+  }
+
+  state.scanProgressStartedAt = performance.now();
+  state.scanProgressPercent = 4;
+  elements.scanProgress.classList.remove("is-hidden");
+  elements.scanProgress.dataset.mode = "busy";
+  elements.progressLabel.textContent = "Escaneando arquivos e diretorios";
+  elements.progressElapsed.textContent = "0.0s";
+  elements.progressBar.style.width = "4%";
+
+  if (state.scanProgressTimer) {
+    window.clearInterval(state.scanProgressTimer);
+  }
+
+  state.scanProgressTimer = window.setInterval(updateScanProgress, 180);
+}
+
+function updateScanProgress() {
+  if (!elements.scanProgress || !state.scanProgressStartedAt) {
+    return;
+  }
+
+  const elapsedMs = performance.now() - state.scanProgressStartedAt;
+  const nextPercent = state.scanProgressPercent + Math.max(0.18, (94 - state.scanProgressPercent) * 0.018);
+  state.scanProgressPercent = Math.min(94, nextPercent);
+  elements.progressElapsed.textContent = formatElapsed(elapsedMs);
+  elements.progressBar.style.width = `${state.scanProgressPercent.toFixed(1)}%`;
+  elements.progressLabel.textContent = elapsedMs > 8000
+    ? "Analisando dependencias, uso e riscos"
+    : "Escaneando arquivos e diretorios";
+}
+
+function finishScanProgress(mode, result) {
+  if (!elements.scanProgress) {
+    return;
+  }
+
+  if (state.scanProgressTimer) {
+    window.clearInterval(state.scanProgressTimer);
+    state.scanProgressTimer = null;
+  }
+
+  const elapsedMs = state.scanProgressStartedAt ? performance.now() - state.scanProgressStartedAt : 0;
+  elements.scanProgress.dataset.mode = mode;
+  elements.progressElapsed.textContent = formatElapsed(elapsedMs);
+
+  if (mode === "ok") {
+    const summary = result?.summary || {};
+    elements.progressBar.style.width = "100%";
+    elements.progressLabel.textContent = `Concluido: ${formatNumber(summary.files || 0)} arquivos, ${formatNumber(summary.directories || 0)} diretorios`;
+  } else {
+    elements.progressLabel.textContent = "Varredura interrompida";
+  }
+}
+
+function formatElapsed(ms) {
+  const seconds = Math.max(0, ms / 1000);
+  if (seconds < 60) {
+    return `${seconds.toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.floor(seconds % 60).toString().padStart(2, "0");
+  return `${minutes}m ${remainingSeconds}s`;
+}
+
 function renderAll() {
   renderMetrics();
   renderGraph();
   renderFiles();
   renderSimulation();
+  renderRelocationPlan();
+  renderContinuousState();
+  renderCycles();
+  renderTextReport();
   renderDependencies();
   renderWarnings();
   renderNodeDetails();
@@ -258,6 +368,12 @@ function renderEmpty() {
   elements.filesTable.innerHTML = empty("Nenhuma varredura executada.");
   elements.dependenciesTable.innerHTML = empty("Nenhuma dependência detectada ainda.");
   elements.simulationGrid.innerHTML = "";
+  if (elements.areSummary) elements.areSummary.innerHTML = empty("Execute uma varredura para calcular o A.R.E.");
+  if (elements.areModalBody) elements.areModalBody.innerHTML = empty("Execute uma varredura para calcular o A.R.E.");
+  if (elements.openAreModal) elements.openAreModal.disabled = true;
+  if (elements.continuousState) elements.continuousState.innerHTML = "";
+  if (elements.cyclesList) elements.cyclesList.innerHTML = empty("Nenhum ciclo detectado.");
+  if (elements.textReport) elements.textReport.textContent = "";
   elements.warningsList.innerHTML = empty("Sem avisos.");
   updateZoomLabel();
 }
@@ -267,6 +383,12 @@ function renderError(message) {
   elements.filesTable.innerHTML = empty(message);
   elements.dependenciesTable.innerHTML = empty(message);
   elements.simulationGrid.innerHTML = "";
+  if (elements.areSummary) elements.areSummary.innerHTML = empty(message);
+  if (elements.areModalBody) elements.areModalBody.innerHTML = empty(message);
+  if (elements.openAreModal) elements.openAreModal.disabled = true;
+  if (elements.continuousState) elements.continuousState.innerHTML = "";
+  if (elements.cyclesList) elements.cyclesList.innerHTML = empty(message);
+  if (elements.textReport) elements.textReport.textContent = message;
   elements.warningsList.innerHTML = empty(message);
   clearCanvas(message);
 }
@@ -279,13 +401,15 @@ function renderMetrics() {
   const scale = state.result.scaleEstimate?.scale || "n/d";
   elements.metrics.innerHTML = metricMarkup([
     [summary.entries, "entradas lidas"],
+    [summary.cycles || 0, "ciclos"],
     [summary.files, "arquivos"],
     [summary.directories, "diretórios"],
     [summary.canDelete || 0, "pode apagar"],
     [summary.probablyUseless || 0, "inútil provável"],
     [summary.mustKeep || 0, "não apagar"],
+    [summary.byRisk.critico || 0, "critico"],
     [summary.byRisk.alto || 0, "alto risco"],
-    [summary.staleCandidates || summary.candidateLowRisk, `candidatos · ${scale}`]
+    [summary.staleCandidates || summary.candidateLowRisk, `candidatos - ${scale}`]
   ]);
 }
 
@@ -326,7 +450,7 @@ function renderGraph() {
   state.currentGraphNodes = visibleNodes;
   state.currentGraphEdges = edges;
 
-  elements.graphHint.textContent = `${mode.label} · ${visibleNodes.length}/${view.nodes.length} nós · ${focusText()}`;
+  elements.graphHint.textContent = `${mode.label} - ${visibleNodes.length}/${view.nodes.length} nos - ${focusText()}`;
   updateZoomLabel(mode);
 
   if (!visibleNodes.length) {
@@ -357,7 +481,7 @@ function updateZoomLabel(mode = resolveGraphMode()) {
   if (!elements.zoomLabel) {
     return;
   }
-  elements.zoomLabel.textContent = `${mode.label} · ${Math.round(state.zoom * 100)}%`;
+  elements.zoomLabel.textContent = `${mode.label} - ${Math.round(state.zoom * 100)}%`;
   elements.modeFar?.classList.toggle("is-active", mode.key === "far");
   elements.modeMedium?.classList.toggle("is-active", mode.key === "medium");
   elements.modeClose?.classList.toggle("is-active", mode.key === "close");
@@ -456,8 +580,8 @@ function buildUiGroupNode(groupId, key, files, mode, expanded) {
   return {
     id: groupId,
     kind: "ui_group",
-    label: `${labelParts.filter(Boolean).join(" · ")} (${files.length})`,
-    name: labelParts.filter(Boolean).join(" · "),
+    label: `${labelParts.filter(Boolean).join(" - ")} (${files.length})`,
+    name: labelParts.filter(Boolean).join(" - "),
     relativePath: dir,
     extension: extension || "",
     risk: maxRiskClient(files),
@@ -771,7 +895,7 @@ function drawNodeLabel(context, point, mode, options = {}) {
 }
 
 function importantNode(node) {
-  return node.risk === "alto" || node.deletionDecision === "pode_apagar" || (node.impactCount || 0) >= 4;
+  return node.risk === "critico" || node.risk === "alto" || node.deletionDecision === "pode_apagar" || (node.impactCount || 0) >= 4;
 }
 
 function topDependencyLabelIds(layout, mode) {
@@ -798,6 +922,9 @@ function topDirectoryFromPath(relativePath) {
 }
 
 function maxRiskClient(files) {
+  if (files.some((file) => file.risk === "critico")) {
+    return "critico";
+  }
   if (files.some((file) => file.risk === "alto")) {
     return "alto";
   }
@@ -1048,7 +1175,7 @@ function renderSimulation() {
     const items = decisions[key] || [];
     return `
       <article class="bucket">
-        <h3>${escapeHtml(title)} · ${formatNumber(items.length)}</h3>
+        <h3>${escapeHtml(title)} - ${formatNumber(items.length)}</h3>
         <p class="muted">${escapeHtml(subtitle)}</p>
         ${items.length ? `
           <ol>
@@ -1063,6 +1190,337 @@ function renderSimulation() {
       </article>
     `;
   }).join("");
+}
+
+function renderRelocationPlan() {
+  if (!state.result || !elements.areSummary || !elements.areModalBody) {
+    return;
+  }
+
+  const plan = state.result.relocationPlan;
+  if (!plan) {
+    elements.areSummary.innerHTML = empty("Plano A.R.E indisponivel.");
+    elements.areModalBody.innerHTML = empty("Plano A.R.E indisponivel.");
+    if (elements.openAreModal) elements.openAreModal.disabled = true;
+    return;
+  }
+
+  if (elements.openAreModal) elements.openAreModal.disabled = false;
+  elements.areSummary.innerHTML = renderAreSummary(plan);
+  elements.areModalBody.innerHTML = renderAreModal(plan);
+  elements.areSummary.querySelectorAll("[data-open-are-modal]").forEach((button) => {
+    button.addEventListener("click", openAreModal);
+  });
+}
+
+function renderAreSummary(plan) {
+  const modes = ["baixo", "medio", "alto"];
+  return `
+    <div class="are-summary-grid">
+      ${modes.map((modeKey) => {
+        const mode = plan.spaceModes?.[modeKey] || {};
+        return `
+          <button class="are-summary-card" type="button" data-open-are-modal>
+            <span>${escapeHtml(modeLabel(modeKey))}</span>
+            <strong>${escapeHtml(mode.reallocatableHuman || "0 B")}</strong>
+            <small>${formatNumber(mode.packageCount || 0)} pacote(s) simulados</small>
+          </button>
+        `;
+      }).join("")}
+      <button class="are-summary-card are-summary-card-blocked" type="button" data-open-are-modal>
+        <span>Bloqueados</span>
+        <strong>${escapeHtml(plan.summary?.blockedHuman || "0 B")}</strong>
+        <small>${formatNumber(plan.blockedFiles?.length || 0)} arquivo(s)</small>
+      </button>
+    </div>
+  `;
+}
+
+function renderAreModal(plan) {
+  const modes = ["baixo", "medio", "alto"];
+  return `
+    ${renderAreSimulation(plan)}
+    <section class="are-modal-summary">
+      ${modes.map((modeKey) => {
+        const mode = plan.spaceModes?.[modeKey] || {};
+        const simulation = plan.relocationSimulation?.[modeKey] || {};
+        return `
+          <article class="are-mode-total are-mode-${escapeHtml(modeKey)}">
+            <span>${escapeHtml(modeLabel(modeKey))}</span>
+            <strong>${escapeHtml(mode.reallocatableHuman || "0 B")}</strong>
+            <small>${formatNumber(mode.packageCount || 0)} pacote(s) / depois: ${escapeHtml(simulation.remainingHuman || "0 B")}</small>
+          </article>
+        `;
+      }).join("")}
+      <article class="are-mode-total are-mode-blocked">
+        <span>Bloqueados</span>
+        <strong>${escapeHtml(plan.summary?.blockedHuman || "0 B")}</strong>
+        <small>${formatNumber(plan.blockedFiles?.length || 0)} arquivo(s)</small>
+      </article>
+    </section>
+    <section class="are-safety-report">
+      <h3>Relatorio de seguranca</h3>
+      <p>${escapeHtml(plan.safetyReport?.text || "Sem relatorio.")}</p>
+    </section>
+    ${modes.map((modeKey) => renderAreMode(plan.spaceModes?.[modeKey], modeKey)).join("")}
+    ${renderBlockedFiles(plan.blockedFiles || [])}
+  `;
+}
+
+function renderAreSimulation(plan) {
+  const modes = ["baixo", "medio", "alto"];
+  return `
+    <section class="are-simulation-board">
+      <div class="are-section-heading">
+        <div>
+          <h3>Simulacao de realocacao</h3>
+          <p class="muted">Mostra quanto sairia do diretorio principal se o usuario confirmasse a realocacao.</p>
+        </div>
+      </div>
+      <div class="are-simulation-grid">
+        ${modes.map((modeKey) => {
+          const simulation = plan.relocationSimulation?.[modeKey] || {};
+          const percent = clamp(Number(simulation.relocatedPercent || 0), 0, 100);
+          return `
+            <article class="are-simulation-card">
+              <div class="are-simulation-head">
+                <strong>${escapeHtml(modeLabel(modeKey))}</strong>
+                <span>${escapeHtml(simulation.relocatedHuman || "0 B")}</span>
+              </div>
+              <div class="space-bar" aria-label="Espaco realocado em ${escapeHtml(modeKey)}">
+                <span style="width: ${percent}%"></span>
+              </div>
+              <dl>
+                <dt>antes</dt><dd>${escapeHtml(simulation.beforeHuman || "0 B")}</dd>
+                <dt>realocado</dt><dd>${escapeHtml(simulation.relocatedHuman || "0 B")}</dd>
+                <dt>depois</dt><dd>${escapeHtml(simulation.remainingHuman || "0 B")}</dd>
+                <dt>pacotes</dt><dd>${formatNumber(simulation.packageCount || 0)}</dd>
+              </dl>
+              <p class="muted">${escapeHtml(simulation.explanation || "")}</p>
+            </article>
+          `;
+        }).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderAreMode(mode, modeKey) {
+  const candidates = mode?.candidates || [];
+  return `
+    <section class="are-mode-section">
+      <div class="are-section-heading">
+        <div>
+          <h3>${escapeHtml(modeLabel(modeKey))} - ${escapeHtml(mode?.reallocatableHuman || "0 B")}</h3>
+          <p class="muted">${escapeHtml(mode?.description || "")}</p>
+        </div>
+        <span class="risk ${escapeHtml(modeRiskClass(modeKey))}">${escapeHtml(modeKey)}</span>
+      </div>
+      <ul class="are-criteria-list">
+        ${(mode?.criteria || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+      </ul>
+      ${renderArePackageTable(mode?.packages || [])}
+      ${renderAreCandidateTable(candidates)}
+    </section>
+  `;
+}
+
+function renderArePackageTable(packages) {
+  if (!packages.length) {
+    return empty("Nenhum pacote simulado neste nivel.");
+  }
+  return `
+    <div class="table-wrap are-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Pacote simulado</th>
+            <th>Espaco</th>
+            <th>Arquivos</th>
+            <th>Destino simulado</th>
+            <th>Justificativa</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${packages.slice(0, 60).map((item) => `
+            <tr>
+              <td class="path-cell">${escapeHtml(item.files[0] || item.id)}</td>
+              <td>${escapeHtml(item.human || formatBytes(item.bytes || 0))}</td>
+              <td>${formatNumber(item.fileCount || 0)}</td>
+              <td>${escapeHtml(item.targetDirectory || "-")}</td>
+              <td>${escapeHtml(item.justification || "-")}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderAreCandidateTable(candidates) {
+  if (!candidates.length) {
+    return empty("Nenhum candidato neste nivel.");
+  }
+  return `
+    <div class="table-wrap are-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Arquivo</th>
+            <th>Pacote</th>
+            <th>Classe</th>
+            <th>Risco</th>
+            <th>Ult. acesso</th>
+            <th>Ult. mod.</th>
+            <th>Justificativa</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${candidates.slice(0, 80).map((item) => `
+            <tr>
+              <td class="path-cell">${escapeHtml(item.path)}</td>
+              <td>${escapeHtml(item.packageHuman || item.sizeHuman || "0 B")}<br><span class="muted">${formatNumber(item.packageFileCount || 1)} arquivo(s)</span></td>
+              <td>${escapeHtml(labels[item.classification] || item.classification || "-")}</td>
+              <td>${riskMarkup(item.risk)}</td>
+              <td>${formatAccess(item.daysSinceAccess)}</td>
+              <td>${formatAccess(item.daysSinceModified)}</td>
+              <td>${escapeHtml(item.justification || "-")}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderBlockedFiles(blockedFiles) {
+  return `
+    <section class="are-mode-section are-blocked-section">
+      <div class="are-section-heading">
+        <div>
+          <h3>Arquivos bloqueados - ${formatNumber(blockedFiles.length)}</h3>
+          <p class="muted">Arquivos fora dos niveis baixo, medio e alto por risco, sistema, ciclo, uso recente ou dependencia importante.</p>
+        </div>
+      </div>
+      ${blockedFiles.length ? `
+        <div class="table-wrap are-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Arquivo</th>
+                <th>Tamanho</th>
+                <th>Classe</th>
+                <th>Risco</th>
+                <th>Motivo</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${blockedFiles.slice(0, 120).map((item) => `
+                <tr>
+                  <td class="path-cell">${escapeHtml(item.path)}</td>
+                  <td>${escapeHtml(item.sizeHuman || formatBytes(item.sizeBytes || 0))}</td>
+                  <td>${escapeHtml(labels[item.classification] || item.classification || "-")}</td>
+                  <td>${riskMarkup(item.risk)}</td>
+                  <td>${escapeHtml(item.reason || item.blockingReasons?.[0] || "-")}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : empty("Nenhum arquivo bloqueado.")}
+    </section>
+  `;
+}
+
+function openAreModal() {
+  if (!state.result?.relocationPlan || !elements.areModal) {
+    return;
+  }
+  elements.areModal.classList.remove("is-hidden");
+  elements.areModal.setAttribute("aria-hidden", "false");
+  document.body.classList.add("modal-open");
+}
+
+function closeAreModal() {
+  if (!elements.areModal) {
+    return;
+  }
+  elements.areModal.classList.add("is-hidden");
+  elements.areModal.setAttribute("aria-hidden", "true");
+  document.body.classList.remove("modal-open");
+}
+
+function modeLabel(modeKey) {
+  const labels = {
+    baixo: "Nivel baixo",
+    medio: "Nivel medio",
+    alto: "Nivel alto"
+  };
+  return labels[modeKey] || modeKey;
+}
+
+function modeRiskClass(modeKey) {
+  if (modeKey === "baixo") return "baixo";
+  if (modeKey === "medio") return "medio";
+  return "alto";
+}
+
+function renderContinuousState() {
+  if (!state.result || !elements.continuousState) {
+    return;
+  }
+
+  const alc = state.result.continuousState;
+  if (!alc) {
+    elements.continuousState.innerHTML = empty("Estado A.L.C indisponivel.");
+    return;
+  }
+
+  const summary = alc.summary || {};
+  elements.continuousState.innerHTML = metricMarkup([
+    [alc.mode === "primeiro_estado" ? "inicial" : "comparacao", "modo"],
+    [summary.newFiles || 0, "novos"],
+    [summary.modifiedFiles || 0, "modificados"],
+    [summary.removedFiles || 0, "removidos"],
+    [summary.riskChangedFiles || 0, "mudanca risco"],
+    [summary.dependencyChangedFiles || 0, "mudanca deps"],
+    [summary.reanalysisNeeded ? "sim" : "nao", "reanalise"],
+    [state.result.modules?.alc?.statePath ? "salvo" : "nao salvo", "estado"]
+  ]);
+}
+
+function renderCycles() {
+  if (!state.result || !elements.cyclesList) {
+    return;
+  }
+
+  const cycles = state.result.cycles || [];
+  if (!cycles.length) {
+    elements.cyclesList.innerHTML = empty("Nenhum ciclo detectado por DFS.");
+    return;
+  }
+
+  const nodesById = new Map(state.result.nodes.map((node) => [node.id, node]));
+  elements.cyclesList.innerHTML = cycles.map((cycle) => {
+    const files = cycle.nodeIds
+      .map((id) => nodesById.get(id)?.relativePath)
+      .filter(Boolean)
+      .join(" -> ");
+    return `
+      <div class="warning-item critical-warning">
+        <strong>${escapeHtml(cycle.id)} - ${formatNumber(cycle.nodeCount)} arquivos</strong>
+        <p class="muted">${escapeHtml(files)}</p>
+        <p class="muted">${escapeHtml(cycle.suggestion || "manter junto e revisar manualmente")}</p>
+      </div>
+    `;
+  }).join("");
+}
+
+function renderTextReport() {
+  if (!state.result || !elements.textReport) {
+    return;
+  }
+  elements.textReport.textContent = state.result.report?.text || "";
 }
 
 function renderDependencies() {
@@ -1159,6 +1617,7 @@ function utilityLabel(value) {
     protegido: "protegido",
     usado_pelo_usuario: "usado",
     dependencia_relevante: "dependência relevante",
+    bloco_interdependente: "bloco interdependente",
     inutil_provavel: "inútil provável",
     baixo_uso: "baixo uso",
     utilidade_incerta: "incerta",
@@ -1172,6 +1631,7 @@ function impactLabel(value) {
     afeta_sistema: "afeta sistema",
     nao_afeta_sistema: "não afeta sistema",
     protegido: "protegido",
+    critico: "critico",
     alto: "alto",
     medio: "médio",
     baixo: "baixo",
@@ -1205,7 +1665,11 @@ function formatBytes(bytes) {
 }
 
 function formatNumber(value) {
-  return new Intl.NumberFormat("pt-BR").format(Number(value || 0));
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return String(value ?? "-");
+  }
+  return new Intl.NumberFormat("pt-BR").format(numeric);
 }
 
 function formatCompact(value) {

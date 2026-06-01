@@ -48,35 +48,18 @@ const SPECIAL_TEXT_FILES = new Set([
   "build.gradle"
 ]);
 
+const MAX_SCAN_FILES = 1500;
+const MAX_SCAN_DEPTH = 88;
+
 const DEFAULT_OPTIONS = {
   adaptive: true,
-  maxFiles: 5000,
-  maxDepth: 18,
+  maxFiles: MAX_SCAN_FILES,
+  maxDepth: MAX_SCAN_DEPTH,
   maxFileSizeBytes: 512 * 1024,
   unusedDaysThreshold: loadFileKnowledge().recentUse?.unusedWindowDays || 30,
   frequentUseDaysThreshold: loadFileKnowledge().recentUse?.frequentWindowDays || 7,
   includeHidden: true,
   skipDirectories: [
-    ".git",
-    ".hg",
-    ".svn",
-    ".next",
-    ".nuxt",
-    ".turbo",
-    ".venv",
-    ".idea",
-    ".vscode",
-    "__pycache__",
-    "bin",
-    "build",
-    "coverage",
-    "dist",
-    "env",
-    "node_modules",
-    "obj",
-    "out",
-    "target",
-    "venv",
     "$Recycle.Bin",
     "Program Files",
     "Program Files (x86)",
@@ -219,6 +202,8 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
     }
   }
 
+  const cycles = detectCyclesDfs(fileNodes, edges);
+  applyCycleMetadata(fileNodes, cycles);
   const components = buildComponents(fileNodes, edges);
   const depthById = computeDepths(fileNodes);
   applyComponentMetadata(fileNodes, components);
@@ -228,17 +213,26 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
     node.depth = depthById.get(node.id) || 0;
     classifyNode(node, options);
   }
+  applySimulationMetadata(fileNodes);
 
   for (const component of components) {
     const componentNodes = component.nodeIds.map((id) => fileNodes.find((node) => node.id === id)).filter(Boolean);
     component.depth = Math.max(0, ...componentNodes.map((node) => node.depth));
+    component.criticalRiskNodes = componentNodes.filter((node) => node.risk === "critico").length;
     component.highRiskNodes = componentNodes.filter((node) => node.risk === "alto").length;
     component.mediumRiskNodes = componentNodes.filter((node) => node.risk === "medio").length;
     component.hasProtected = componentNodes.some((node) => node.classification === "critico_protegido");
-    component.risk = component.hasProtected || component.highRiskNodes > 0 ? "alto" : component.mediumRiskNodes > 0 ? "medio" : "baixo";
+    component.hasCycle = componentNodes.some((node) => node.inCycle);
+    component.risk = component.criticalRiskNodes > 0 || component.hasCycle
+      ? "critico"
+      : component.hasProtected || component.highRiskNodes > 0
+        ? "alto"
+        : component.mediumRiskNodes > 0
+          ? "medio"
+          : "baixo";
   }
 
-  const summary = buildSummary(nodes, fileNodes, edges, components, skipped, warnings, startedAt);
+  const summary = buildSummary(nodes, fileNodes, edges, components, cycles, skipped, warnings, startedAt);
   const simulation = buildSimulation(fileNodes);
   const graphViews = buildGraphViews(nodes, fileNodes, edges);
 
@@ -252,6 +246,7 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
     nodes: nodes.map(stripInternalNodeFields),
     edges,
     components,
+    cycles,
     graphViews,
     simulation,
     skipped,
@@ -367,6 +362,13 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
         impactCount: 0,
         componentId: null,
         componentSize: 1,
+        dfsColor: "branco",
+        inCycle: false,
+        cycleBlockId: null,
+        cycleBlockIds: [],
+        cycleGroupSize: 0,
+        dependsOn: [],
+        dependents: [],
         classification: "isolado",
         risk: "baixo",
         riskScore: 0,
@@ -380,6 +382,7 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
         deletionDecision: "averiguar",
         relocationDecision: "pode_mexer",
         simulationAction: "separar_como_isolado",
+        simulation: null,
         canReadContent,
         readError: null,
         detectedDependencies: [],
@@ -407,7 +410,7 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
 async function estimateDirectoryScale(root) {
   const queue = [{ absolutePath: root, depth: 0 }];
   const visited = new Set();
-  const maxEntries = 1600;
+  const maxEntries = 16000;
   let sampledFiles = 0;
   let sampledDirectories = 0;
   let maxObservedDepth = 0;
@@ -473,8 +476,8 @@ function normalizeOptions(rawOptions, scaleEstimate = { scale: "medio" }) {
   };
 
   options.adaptive = adaptive;
-  options.maxFiles = clampInteger(options.maxFiles, 100, 50000, DEFAULT_OPTIONS.maxFiles);
-  options.maxDepth = clampInteger(options.maxDepth, 1, 64, DEFAULT_OPTIONS.maxDepth);
+  options.maxFiles = clampInteger(options.maxFiles, 100, MAX_SCAN_FILES, DEFAULT_OPTIONS.maxFiles);
+  options.maxDepth = clampInteger(options.maxDepth, 1, MAX_SCAN_DEPTH, DEFAULT_OPTIONS.maxDepth);
   options.maxFileSizeBytes = clampInteger(options.maxFileSizeBytes, 16 * 1024, 5 * 1024 * 1024, DEFAULT_OPTIONS.maxFileSizeBytes);
   options.unusedDaysThreshold = clampInteger(options.unusedDaysThreshold, 1, 3650, DEFAULT_OPTIONS.unusedDaysThreshold);
   options.frequentUseDaysThreshold = clampInteger(options.frequentUseDaysThreshold, 1, 60, DEFAULT_OPTIONS.frequentUseDaysThreshold);
@@ -486,28 +489,28 @@ function normalizeOptions(rawOptions, scaleEstimate = { scale: "medio" }) {
 function adaptiveProfile(scale) {
   if (scale === "massivo") {
     return {
-      maxFiles: 15000,
-      maxDepth: 12,
+      maxFiles: MAX_SCAN_FILES,
+      maxDepth: MAX_SCAN_DEPTH,
       maxFileSizeBytes: 128 * 1024
     };
   }
   if (scale === "grande") {
     return {
-      maxFiles: 10000,
-      maxDepth: 15,
+      maxFiles: MAX_SCAN_FILES,
+      maxDepth: 72,
       maxFileSizeBytes: 256 * 1024
     };
   }
   if (scale === "medio") {
     return {
-      maxFiles: 7000,
-      maxDepth: 18,
+      maxFiles: MAX_SCAN_FILES,
+      maxDepth: 88,
       maxFileSizeBytes: 512 * 1024
     };
   }
   return {
-    maxFiles: 3000,
-    maxDepth: 24,
+    maxFiles: MAX_SCAN_FILES,
+    maxDepth: 96,
     maxFileSizeBytes: 1024 * 1024
   };
 }
@@ -909,7 +912,8 @@ function buildComponents(fileNodes, edges) {
       }
     }
 
-    const edgeCount = edges.filter((edge) => nodeIds.includes(edge.source) || nodeIds.includes(edge.target)).length;
+    const nodeIdSet = new Set(nodeIds);
+    const edgeCount = edges.filter((edge) => nodeIdSet.has(edge.source) && nodeIdSet.has(edge.target)).length;
     components.push({
       id: `component:${components.length + 1}`,
       nodeIds,
@@ -918,12 +922,93 @@ function buildComponents(fileNodes, edges) {
       depth: 0,
       risk: "baixo",
       hasProtected: false,
+      hasCycle: false,
+      criticalRiskNodes: 0,
       highRiskNodes: 0,
       mediumRiskNodes: 0
     });
   }
 
   return components.sort((a, b) => b.nodeCount - a.nodeCount);
+}
+
+function detectCyclesDfs(fileNodes, edges) {
+  const adjacency = new Map(fileNodes.map((node) => [node.id, []]));
+  const color = new Map(fileNodes.map((node) => [node.id, "branco"]));
+  const stack = [];
+  const cycles = [];
+  const seenCycles = new Set();
+
+  for (const edge of edges) {
+    adjacency.get(edge.source)?.push(edge.target);
+  }
+
+  function visit(nodeId) {
+    color.set(nodeId, "cinza");
+    stack.push(nodeId);
+
+    for (const nextId of adjacency.get(nodeId) || []) {
+      const nextColor = color.get(nextId) || "branco";
+      if (nextColor === "branco") {
+        visit(nextId);
+      } else if (nextColor === "cinza") {
+        const cycleStart = stack.indexOf(nextId);
+        if (cycleStart !== -1) {
+          const orderedNodeIds = stack.slice(cycleStart);
+          const key = canonicalCycleKey(orderedNodeIds);
+          if (!seenCycles.has(key)) {
+            seenCycles.add(key);
+            cycles.push({
+              id: `cycle:${cycles.length + 1}`,
+              type: "bloco_interdependente",
+              nodeIds: orderedNodeIds,
+              nodeCount: orderedNodeIds.length,
+              closingEdge: `${nodeId}->${nextId}`,
+              risk: "critico",
+              suggestion: "manter arquivos juntos e revisar manualmente antes de mover ou apagar"
+            });
+          }
+        }
+      }
+    }
+
+    stack.pop();
+    color.set(nodeId, "preto");
+  }
+
+  for (const node of fileNodes) {
+    if ((color.get(node.id) || "branco") === "branco") {
+      visit(node.id);
+    }
+  }
+
+  for (const node of fileNodes) {
+    node.dfsColor = color.get(node.id) || "preto";
+  }
+
+  return cycles;
+}
+
+function canonicalCycleKey(nodeIds) {
+  const uniqueIds = Array.from(new Set(nodeIds));
+  return uniqueIds.slice().sort().join("|");
+}
+
+function applyCycleMetadata(fileNodes, cycles) {
+  const byId = new Map(fileNodes.map((node) => [node.id, node]));
+
+  for (const cycle of cycles) {
+    for (const nodeId of cycle.nodeIds) {
+      const node = byId.get(nodeId);
+      if (!node) {
+        continue;
+      }
+      node.inCycle = true;
+      node.cycleBlockId = node.cycleBlockId || cycle.id;
+      node.cycleBlockIds.push(cycle.id);
+      node.cycleGroupSize = Math.max(node.cycleGroupSize || 0, cycle.nodeCount);
+    }
+  }
 }
 
 function applyComponentMetadata(fileNodes, components) {
@@ -959,6 +1044,46 @@ function applyImpactMetadata(fileNodes) {
     }
 
     node.impactCount = impacted.size;
+  }
+}
+
+function applySimulationMetadata(fileNodes) {
+  const byId = new Map(fileNodes.map((node) => [node.id, node]));
+
+  for (const node of fileNodes) {
+    const dependsOnNodes = node.outgoingTo.map((id) => byId.get(id)).filter(Boolean);
+    const dependentNodes = node.incomingFrom.map((id) => byId.get(id)).filter(Boolean);
+    const cycleMembers = node.inCycle
+      ? fileNodes.filter((candidate) => candidate.cycleBlockIds.some((id) => node.cycleBlockIds.includes(id)))
+      : [];
+    const moveWith = new Map();
+
+    for (const dependency of dependsOnNodes) {
+      moveWith.set(dependency.id, dependency);
+    }
+    for (const cycleMember of cycleMembers) {
+      if (cycleMember.id !== node.id) {
+        moveWith.set(cycleMember.id, cycleMember);
+      }
+    }
+
+    node.dependsOn = dependsOnNodes.map((item) => item.relativePath).sort();
+    node.dependents = dependentNodes.map((item) => item.relativePath).sort();
+    node.simulation = {
+      dependsOn: node.dependsOn,
+      dependents: node.dependents,
+      wouldBreakDependents: dependentNodes.length > 0,
+      wouldBreakCount: dependentNodes.length,
+      transitiveBreakCount: node.impactCount,
+      moveRequires: Array.from(moveWith.values()).map((item) => item.relativePath).sort(),
+      belongsToCycle: node.inCycle,
+      cycleBlockId: node.cycleBlockId,
+      cycleBlockIds: node.cycleBlockIds,
+      cycleGroupSize: node.cycleGroupSize,
+      safeToDelete: node.deletionDecision === "pode_apagar",
+      safeToMove: node.relocationDecision === "pode_mexer",
+      recommendation: simulationReason(node)
+    };
   }
 }
 
@@ -1003,10 +1128,20 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
   const isFrequentlyUsed = node.daysSinceAccess <= options.frequentUseDaysThreshold;
   const isLowValueGenerated = Boolean(knowledge.isLowValueGenerated);
   const isUserContent = Boolean(knowledge.isUserContent);
+  const isInCycle = Boolean(node.inCycle);
+  const isCentralDependency = node.incoming >= 8 || node.impactCount >= 16 || node.componentSize >= 25;
   const dependencyImpact = dependencyImpactFor(node);
 
   if (reasons.length) {
     riskScore += 80;
+  }
+  if (isInCycle) {
+    riskScore += 100;
+    reasons.push(`bloco interdependente por DFS (${node.cycleGroupSize || 2} arquivos)`);
+  }
+  if (isCentralDependency) {
+    riskScore += 60;
+    reasons.push("dependencia central no grafo");
   }
   riskScore += node.incoming * 12;
   riskScore += node.outgoing * 4;
@@ -1053,31 +1188,36 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
 
   if (node.protectedReasons.length) {
     node.classification = "critico_protegido";
-    node.risk = "alto";
+    node.risk = isSystemProtected || isCentralDependency ? "critico" : "alto";
     node.simulationAction = "proteger_nao_mover";
     node.relocationDecision = "nao_mover";
+  } else if (isInCycle) {
+    node.classification = "misto";
+    node.risk = "critico";
+    node.simulationAction = "manter_bloco_interdependente";
+    node.relocationDecision = "manter_junto";
   } else if (node.incoming === 0 && node.outgoing === 0 && node.unresolvedDependencies === 0) {
     node.classification = "isolado";
     node.risk = riskScore >= 30 ? "medio" : "baixo";
     node.simulationAction = node.risk === "baixo" ? "candidato_para_realocacao" : "revisar_uso_recente";
     node.relocationDecision = node.risk === "baixo" ? "pode_mexer" : "averiguar";
   } else if (node.incoming > 0 && node.outgoing > 0) {
-    node.classification = "dependente_provedor";
-    node.risk = riskScore >= 65 || node.impactCount >= 6 ? "alto" : "medio";
+    node.classification = "misto";
+    node.risk = isCentralDependency ? "critico" : riskScore >= 65 || node.impactCount >= 6 ? "alto" : "medio";
     node.simulationAction = "revisar_dependencias";
-    node.relocationDecision = node.risk === "alto" ? "nao_mover" : "averiguar";
+    node.relocationDecision = node.risk === "alto" || node.risk === "critico" ? "nao_mover" : "averiguar";
   } else if (node.incoming > 0) {
-    node.classification = "provedor";
-    node.risk = node.incoming >= 4 || node.impactCount >= 8 || riskScore >= 60 ? "alto" : "medio";
-    node.simulationAction = node.risk === "alto" ? "nao_mover" : "revisar_antes_de_mover";
-    node.relocationDecision = node.risk === "alto" ? "nao_mover" : "averiguar";
+    node.classification = "docente";
+    node.risk = isCentralDependency ? "critico" : node.incoming >= 4 || node.impactCount >= 8 || riskScore >= 60 ? "alto" : "medio";
+    node.simulationAction = node.risk === "alto" || node.risk === "critico" ? "nao_mover" : "revisar_antes_de_mover";
+    node.relocationDecision = node.risk === "alto" || node.risk === "critico" ? "nao_mover" : "averiguar";
   } else if (node.outgoing > 0) {
-    node.classification = "dependente";
+    node.classification = "dicente";
     node.risk = node.unresolvedDependencies > 0 || riskScore >= 45 ? "medio" : "baixo";
     node.simulationAction = node.risk === "baixo" ? "mover_com_dependencias" : "revisar_antes_de_mover";
     node.relocationDecision = node.risk === "baixo" ? "pode_mexer" : "averiguar";
   } else {
-    node.classification = "dependente";
+    node.classification = "dicente";
     node.risk = "medio";
     node.simulationAction = "revisar_dependencias_nao_resolvidas";
     node.relocationDecision = "averiguar";
@@ -1100,6 +1240,7 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
     isFrequentlyUsed,
     isLowValueGenerated,
     isUserContent,
+    isInCycle,
     dependencyImpact
   });
   node.deletionDecision = deletionDecisionFor(node, {
@@ -1109,6 +1250,7 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
     isFrequentlyUsed,
     isLowValueGenerated,
     isUserContent,
+    isInCycle,
     dependencyImpact,
     dependencyLoad
   });
@@ -1126,8 +1268,14 @@ function classifyNode(node, options = DEFAULT_OPTIONS) {
 }
 
 function dependencyImpactFor(node) {
+  if (node.inCycle) {
+    return "critico";
+  }
   if (node.unresolvedDependencies > 0) {
     return "incerto";
+  }
+  if (node.impactCount >= 16 || node.incoming >= 8 || node.componentSize >= 25) {
+    return "critico";
   }
   if (node.fileKnowledge?.isLowValueGenerated && node.incoming === 0 && node.impactCount === 0) {
     return node.outgoing > 0 ? "baixo" : "nenhum";
@@ -1147,6 +1295,9 @@ function dependencyImpactFor(node) {
 function userImpactFor(node, { isFrequentlyUsed, isUnused }) {
   if (node.protectedReasons.length > 0) {
     return "alto";
+  }
+  if (node.inCycle) {
+    return "medio";
   }
   if (isFrequentlyUsed && node.fileKnowledge?.isUserContent) {
     return "alto";
@@ -1170,13 +1321,16 @@ function utilityStatusFor(node, context) {
   if (context.isConfigProtected) {
     return "protegido";
   }
+  if (context.isInCycle) {
+    return "bloco_interdependente";
+  }
   if (context.isLowValueGenerated && node.incoming === 0 && node.impactCount === 0 && node.unresolvedDependencies === 0) {
     return context.isUnused ? "inutil_provavel" : "baixo_uso";
   }
   if (context.isFrequentlyUsed && context.isUserContent) {
     return "usado_pelo_usuario";
   }
-  if (context.dependencyImpact === "alto" || context.dependencyImpact === "medio") {
+  if (context.dependencyImpact === "critico" || context.dependencyImpact === "alto" || context.dependencyImpact === "medio") {
     return "dependencia_relevante";
   }
   if (context.isUnused && node.incoming === 0 && node.outgoing === 0 && node.impactCount === 0 && node.unresolvedDependencies === 0) {
@@ -1189,7 +1343,7 @@ function utilityStatusFor(node, context) {
 }
 
 function deletionDecisionFor(node, context) {
-  if (context.isSystemProtected || context.isConfigProtected) {
+  if (context.isSystemProtected || context.isConfigProtected || context.isInCycle) {
     return "nao_apagar";
   }
   if (context.isLowValueGenerated && node.incoming === 0 && node.impactCount === 0 && node.unresolvedDependencies === 0) {
@@ -1198,7 +1352,7 @@ function deletionDecisionFor(node, context) {
   if (context.isFrequentlyUsed && context.isUserContent) {
     return "nao_apagar";
   }
-  if (context.dependencyImpact === "alto") {
+  if (context.dependencyImpact === "critico" || context.dependencyImpact === "alto") {
     return "nao_apagar";
   }
   if (node.unresolvedDependencies > 0 || context.dependencyImpact === "incerto") {
@@ -1216,7 +1370,7 @@ function deletionDecisionFor(node, context) {
   return "averiguar";
 }
 
-function buildSummary(nodes, fileNodes, edges, components, skipped, warnings, startedAt) {
+function buildSummary(nodes, fileNodes, edges, components, cycles, skipped, warnings, startedAt) {
   const byClassification = countBy(fileNodes, "classification");
   const byRisk = countBy(fileNodes, "risk");
   const byDeletionDecision = countBy(fileNodes, "deletionDecision");
@@ -1230,6 +1384,8 @@ function buildSummary(nodes, fileNodes, edges, components, skipped, warnings, st
     entries: directories + fileNodes.length,
     edges: edges.length,
     components: components.length,
+    cycles: cycles.length,
+    cycleNodes: fileNodes.filter((node) => node.inCycle).length,
     skipped: skipped.length,
     warnings: warnings.length,
     byClassification,
@@ -1247,6 +1403,7 @@ function buildSummary(nodes, fileNodes, edges, components, skipped, warnings, st
     canDelete: fileNodes.filter((node) => node.deletionDecision === "pode_apagar").length,
     probablyUseless: fileNodes.filter((node) => node.utilityStatus === "inutil_provavel" || node.deletionDecision === "inutil_provavel").length,
     mustKeep: fileNodes.filter((node) => node.deletionDecision === "nao_apagar").length,
+    criticalRisk: fileNodes.filter((node) => node.risk === "critico").length,
     protected: fileNodes.filter((node) => node.classification === "critico_protegido").length,
     unresolvedDependencies: fileNodes.reduce((sum, node) => sum + node.unresolvedDependencies, 0),
     recentlyAccessed: fileNodes.filter((node) => node.daysSinceAccess <= 4).length,
@@ -1259,10 +1416,11 @@ function buildSummary(nodes, fileNodes, edges, components, skipped, warnings, st
 function buildSimulation(fileNodes) {
   const buckets = {
     isolados: [],
-    dependentes: [],
-    provedores: [],
+    dicentes: [],
+    docentes: [],
     mistos: [],
     protegidos: [],
+    blocosInterdependentes: [],
     revisar: []
   };
 
@@ -1279,16 +1437,20 @@ function buildSimulation(fileNodes) {
 
     if (node.classification === "isolado") {
       buckets.isolados.push(item);
-    } else if (node.classification === "dependente") {
-      buckets.dependentes.push(item);
-    } else if (node.classification === "provedor") {
-      buckets.provedores.push(item);
-    } else if (node.classification === "dependente_provedor") {
+    } else if (node.classification === "dicente") {
+      buckets.dicentes.push(item);
+    } else if (node.classification === "docente") {
+      buckets.docentes.push(item);
+    } else if (node.classification === "misto") {
       buckets.mistos.push(item);
     } else if (node.classification === "critico_protegido") {
       buckets.protegidos.push(item);
     } else {
       buckets.revisar.push(item);
+    }
+
+    if (node.inCycle) {
+      buckets.blocosInterdependentes.push(item);
     }
   }
 
@@ -1335,13 +1497,21 @@ function toSimulationDecision(node) {
     impactCount: node.impactCount,
     riskScore: node.riskScore,
     riskReasons: node.riskReasons,
-    daysSinceAccess: node.daysSinceAccess
+    daysSinceAccess: node.daysSinceAccess,
+    dependsOn: node.dependsOn,
+    dependents: node.dependents,
+    simulation: node.simulation,
+    inCycle: node.inCycle,
+    cycleBlockId: node.cycleBlockId
   };
 }
 
 function simulationReason(node) {
   if (node.protectedReasons.length) {
     return node.protectedReasons.join(", ");
+  }
+  if (node.inCycle) {
+    return "faz parte de um bloco interdependente detectado por DFS";
   }
   if (node.deletionDecision === "pode_apagar") {
     return "sem uso recente, sem dependencia e fora de area protegida";
@@ -1581,7 +1751,7 @@ function aggregateGraphEdges(edges, nodeForFile) {
 
 function mediumGroupKey(file, edgeTargetsBySource) {
   const degree = file.incoming + file.outgoing;
-  if (file.risk === "alto" || file.classification === "critico_protegido" || degree >= 4) {
+  if (file.risk === "critico" || file.risk === "alto" || file.classification === "critico_protegido" || file.inCycle || degree >= 4) {
     return `single:${file.id}`;
   }
 
@@ -1611,6 +1781,9 @@ function topDirectory(relativePath) {
 }
 
 function maxRisk(files) {
+  if (files.some((file) => file.risk === "critico")) {
+    return "critico";
+  }
   if (files.some((file) => file.risk === "alto")) {
     return "alto";
   }
@@ -1628,7 +1801,7 @@ function commonClassification(files) {
   if (classifications.has("critico_protegido")) {
     return "critico_protegido";
   }
-  return "dependente_provedor";
+  return "misto";
 }
 
 function aggregateDeletionDecision(files) {
@@ -1654,6 +1827,9 @@ function aggregateUtilityStatus(files) {
   }
   if (statuses.has("dependencia_relevante")) {
     return "dependencia_relevante";
+  }
+  if (statuses.has("bloco_interdependente")) {
+    return "bloco_interdependente";
   }
   if (statuses.has("usado_pelo_usuario")) {
     return "usado_pelo_usuario";
@@ -1744,7 +1920,15 @@ const PYTHON_STDLIB = new Set([
 
 module.exports = {
   analyzeDirectory,
+  escanear_diretorio: analyzeDirectory,
   extractDependencies,
+  detectar_dependencias: extractDependencies,
   resolveDependency,
-  DEFAULT_OPTIONS
+  detectar_ciclos: detectCyclesDfs,
+  construir_grafo: buildGraphViews,
+  classificar_arquivo: classifyNode,
+  simular_riscos: buildSimulation,
+  DEFAULT_OPTIONS,
+  MAX_SCAN_FILES,
+  MAX_SCAN_DEPTH
 };

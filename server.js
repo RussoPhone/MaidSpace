@@ -2,6 +2,14 @@ const http = require("node:http");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { analyzeDirectory, DEFAULT_OPTIONS } = require("./src/add/analyzer");
+const { generateRelocationPlan } = require("./src/are/planner");
+const {
+  buildDirectoryState,
+  compareDirectoryStates,
+  loadPreviousState,
+  saveCurrentState
+} = require("./src/alc/state");
+const { generateSrcReport } = require("./src/report");
 
 const rootDirectory = __dirname;
 const publicDirectory = path.join(rootDirectory, "public");
@@ -19,7 +27,7 @@ function createAppServer() {
 
       if (request.method === "POST" && request.url === "/api/scan") {
         const body = await readJsonBody(request);
-        const result = await analyzeDirectory(body.rootPath || rootDirectory, body.options || {});
+        const result = await runSrcPipeline(body.rootPath || rootDirectory, body.options || {});
         return sendJson(response, 200, result);
       }
 
@@ -34,6 +42,52 @@ function createAppServer() {
       });
     }
   });
+}
+
+async function runSrcPipeline(rootPath, options = {}) {
+  const addReport = await analyzeDirectory(rootPath, options);
+  const relocationPlan = generateRelocationPlan(addReport);
+  const currentState = buildDirectoryState(addReport);
+  const previousState = await loadPreviousState(addReport.rootPath);
+  const continuousState = compareDirectoryStates(previousState, currentState);
+  const shouldSaveState = options.saveState !== false;
+  let statePath = null;
+
+  if (shouldSaveState) {
+    statePath = await saveCurrentState(addReport.rootPath, currentState);
+  }
+
+  const report = generateSrcReport({
+    addReport,
+    relocationPlan,
+    continuousState
+  });
+
+  return {
+    ...addReport,
+    system: "S.R.C",
+    modules: {
+      add: {
+        algorithm: "A.D.D",
+        status: "concluido",
+        summary: addReport.summary
+      },
+      are: {
+        algorithm: "A.R.E",
+        status: "plano_gerado",
+        summary: relocationPlan.summary
+      },
+      alc: {
+        algorithm: "A.L.C",
+        status: shouldSaveState ? "estado_salvo" : "estado_nao_salvo",
+        summary: continuousState.summary,
+        statePath
+      }
+    },
+    relocationPlan,
+    continuousState,
+    report
+  };
 }
 
 function startServer({ port = readPort(), host = "127.0.0.1" } = {}) {
@@ -134,5 +188,6 @@ function contentTypeFor(filePath) {
 
 module.exports = {
   createAppServer,
-  startServer
+  startServer,
+  runSrcPipeline
 };

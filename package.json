@@ -2,7 +2,7 @@
   "name": "sistema-relocacao-continua",
   "version": "0.1.0",
   "private": true,
-  "description": "MVP do Sistema de Relocacao Continua com foco no Algoritmo Determinacao Dependencia.",
+  "description": "Sistema de Relocacao Continua com A.D.D, A.R.E e A.L.C em modo seguro.",
   "scripts": {
     "core:check": "cargo check --manifest-path src-core/add-core/Cargo.toml",
     "core:run": "cargo run --manifest-path src-core/add-core/Cargo.toml --",

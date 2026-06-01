@@ -26,6 +26,10 @@ body {
   margin: 0;
 }
 
+body.modal-open {
+  overflow: hidden;
+}
+
 button,
 input,
 select {
@@ -204,6 +208,66 @@ button:disabled {
   background: var(--accent-dark);
 }
 
+.scan-progress {
+  background: #f7fafb;
+  border: 1px solid var(--line-strong);
+  display: grid;
+  gap: 7px;
+  padding: 9px 10px;
+}
+
+.scan-progress.is-hidden {
+  display: none;
+}
+
+.progress-row {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  font-size: 12px;
+  font-weight: 800;
+  gap: 8px;
+  justify-content: space-between;
+  line-height: 1.25;
+}
+
+.progress-track {
+  background: #e2eaed;
+  height: 10px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  background: linear-gradient(90deg, var(--accent), #42a1a6, #e4bb56);
+  display: block;
+  height: 100%;
+  position: relative;
+  transition: width 180ms ease;
+  width: 0;
+}
+
+.scan-progress[data-mode="busy"] .progress-fill::after {
+  animation: progress-glow 1.1s linear infinite;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.75), transparent);
+  content: "";
+  inset: 0;
+  position: absolute;
+  transform: translateX(-100%);
+}
+
+.scan-progress[data-mode="error"] .progress-fill {
+  background: var(--high);
+}
+
+@keyframes progress-glow {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
 .ghost-button,
 .mode-button {
   background: #fff;
@@ -367,11 +431,77 @@ button:disabled {
   background: var(--high);
 }
 
+.dot-critical {
+  background: #7f1d1d;
+}
+
 .decision-grid {
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   padding: 10px;
+}
+
+.plan-grid,
+.state-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 10px;
+}
+
+.plan-summary {
+  padding: 10px;
+}
+
+.are-summary-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.are-summary-card {
+  background: #f9fbfb;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  display: grid;
+  gap: 6px;
+  min-height: 94px;
+  padding: 10px;
+  text-align: left;
+}
+
+.are-summary-card:hover {
+  background: #eef6f7;
+}
+
+.are-summary-card span,
+.are-mode-total span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.are-summary-card strong,
+.are-mode-total strong {
+  display: block;
+  font-size: 24px;
+  line-height: 1;
+}
+
+.are-summary-card small,
+.are-mode-total small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.are-summary-card-blocked {
+  border-left: 4px solid #7f1d1d;
+}
+
+.state-grid {
+  grid-template-columns: repeat(8, minmax(90px, 1fr));
 }
 
 .bucket {
@@ -479,6 +609,203 @@ summary {
   padding: 8px 10px;
 }
 
+.critical-warning {
+  background: #fff1f1;
+  border-left-color: #7f1d1d;
+}
+
+.text-report {
+  background: #f8fafb;
+  border-top: 1px solid var(--line);
+  color: var(--ink);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  padding: 12px;
+  white-space: pre-wrap;
+}
+
+.modal-shell {
+  inset: 0;
+  position: fixed;
+  z-index: 20;
+}
+
+.modal-shell.is-hidden {
+  display: none;
+}
+
+.modal-backdrop {
+  background: rgba(20, 24, 26, 0.58);
+  inset: 0;
+  position: absolute;
+}
+
+.modal-panel {
+  background: #fff;
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  left: 50%;
+  max-height: calc(100vh - 48px);
+  position: absolute;
+  top: 24px;
+  transform: translateX(-50%);
+  width: min(1180px, calc(100vw - 32px));
+}
+
+.modal-header {
+  align-items: center;
+  background: #20272b;
+  color: #fff;
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+}
+
+.modal-header p {
+  color: #c8d2d5;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.modal-body {
+  display: grid;
+  gap: 12px;
+  overflow: auto;
+  padding: 12px;
+}
+
+.are-modal-summary {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.are-simulation-board {
+  background: #f9fbfb;
+  border: 1px solid var(--line);
+  padding: 12px;
+}
+
+.are-simulation-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.are-simulation-card {
+  background: #fff;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+}
+
+.are-simulation-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.are-simulation-head span {
+  color: var(--accent-dark);
+  font-weight: 900;
+}
+
+.space-bar {
+  background: #e8eef1;
+  height: 12px;
+  overflow: hidden;
+}
+
+.space-bar span {
+  background: var(--accent);
+  display: block;
+  height: 100%;
+  min-width: 2px;
+}
+
+.are-simulation-card dl {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.are-simulation-card dt {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.are-simulation-card dd {
+  margin: 0;
+  font-weight: 800;
+}
+
+.are-mode-total,
+.are-safety-report,
+.are-mode-section {
+  background: #f9fbfb;
+  border: 1px solid var(--line);
+  padding: 12px;
+}
+
+.are-mode-baixo {
+  border-left: 4px solid var(--low);
+}
+
+.are-mode-medio {
+  border-left: 4px solid var(--medium);
+}
+
+.are-mode-alto {
+  border-left: 4px solid var(--high);
+}
+
+.are-mode-blocked,
+.are-blocked-section {
+  border-left: 4px solid #7f1d1d;
+}
+
+.are-safety-report {
+  background: #f8fafb;
+}
+
+.are-section-heading {
+  align-items: flex-start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.are-criteria-list {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0 0 10px;
+  padding-left: 18px;
+}
+
+.are-criteria-list li {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.are-table-wrap {
+  max-height: 360px;
+}
+
 .inspector-panel {
   align-self: start;
   display: grid;
@@ -531,6 +858,10 @@ summary {
   background: var(--high);
 }
 
+.risk.critico {
+  background: #7f1d1d;
+}
+
 .empty-state {
   color: var(--muted);
   padding: 14px;
@@ -564,7 +895,13 @@ summary {
   }
 
   .metrics-strip,
-  .decision-grid {
+  .decision-grid,
+  .plan-grid,
+  .state-grid,
+  .are-summary-grid,
+  .are-modal-summary,
+  .are-simulation-grid,
+  .are-criteria-list {
     grid-template-columns: 1fr;
   }
 
