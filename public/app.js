@@ -76,6 +76,8 @@ const elements = {
   rootPath: document.querySelector("#rootPath"),
   adaptiveScan: document.querySelector("#adaptiveScan"),
   saveState: document.querySelector("#saveState"),
+  progressiveScan: document.querySelector("#progressiveScan"),
+  includeProgramFiles: document.querySelector("#includeProgramFiles"),
   maxFiles: document.querySelector("#maxFiles"),
   maxDepth: document.querySelector("#maxDepth"),
   maxFileSize: document.querySelector("#maxFileSize"),
@@ -84,11 +86,13 @@ const elements = {
   progressLabel: document.querySelector("#progressLabel"),
   progressElapsed: document.querySelector("#progressElapsed"),
   progressBar: document.querySelector("#progressBar"),
+  systemLogList: document.querySelector("#systemLogList"),
   exportButton: document.querySelector("#exportButton"),
   metrics: document.querySelector("#metrics"),
   graphCanvas: document.querySelector("#graphCanvas"),
   graphHint: document.querySelector("#graphHint"),
   graphFilter: document.querySelector("#graphFilter"),
+  depthFilter: document.querySelector("#depthFilter"),
   zoomLabel: document.querySelector("#zoomLabel"),
   modeFar: document.querySelector("#modeFar"),
   modeMedium: document.querySelector("#modeMedium"),
@@ -103,6 +107,7 @@ const elements = {
   areModal: document.querySelector("#areModal"),
   areModalBody: document.querySelector("#areModalBody"),
   continuousState: document.querySelector("#continuousState"),
+  depthTimeline: document.querySelector("#depthTimeline"),
   dependenciesTable: document.querySelector("#dependenciesTable"),
   cyclesList: document.querySelector("#cyclesList"),
   textReport: document.querySelector("#textReport"),
@@ -123,6 +128,9 @@ async function init() {
     elements.maxDepth.value = health.defaultOptions.maxDepth;
     elements.maxFileSize.value = health.defaultOptions.maxFileSizeBytes;
     elements.adaptiveScan.checked = health.defaultOptions.adaptive !== false;
+    if (elements.includeProgramFiles) {
+      elements.includeProgramFiles.checked = health.defaultOptions.includeProgramFiles === true;
+    }
     updateAdaptiveInputs();
     setStatus("pronto", "ok");
   } catch (error) {
@@ -134,6 +142,10 @@ function bindEvents() {
   elements.scanButton.addEventListener("click", runScan);
   elements.exportButton.addEventListener("click", exportJson);
   elements.graphFilter.addEventListener("change", renderGraph);
+  elements.depthFilter?.addEventListener("change", () => {
+    renderGraph();
+    renderFiles();
+  });
   elements.fileSearch.addEventListener("input", () => {
     renderFiles();
     renderGraph();
@@ -221,11 +233,19 @@ async function runScan() {
         maxFileSizeBytes: Number(elements.maxFileSize.value)
       };
   options.saveState = elements.saveState?.checked !== false;
+  options.includeProgramFiles = elements.includeProgramFiles?.checked === true;
+
+  if (elements.progressiveScan?.checked) {
+    await runProgressiveScan(rootPath, options);
+    return;
+  }
 
   elements.scanButton.disabled = true;
   elements.exportButton.disabled = true;
   setStatus("escaneando", "busy");
   startScanProgress();
+  resetSystemLog();
+  appendSystemLog("A.D.D iniciado em modo normal.");
 
   try {
     state.result = await fetchJson("/api/scan", {
@@ -238,14 +258,134 @@ async function runScan() {
     syncOptionsFromResult();
     setStatus(`ok - ${state.result.summary.elapsedMs} ms`, "ok");
     finishScanProgress("ok", state.result);
+    appendSystemLog(`Varredura concluida: ${formatNumber(state.result.summary.files || 0)} arquivos e ${formatBytes(state.result.summary.totalBytes || 0)} lidos.`);
     renderAll();
   } catch (error) {
     setStatus("erro na varredura", "error");
     finishScanProgress("error");
+    appendSystemLog(`Erro: ${error.message}`);
     renderError(error.message);
   } finally {
     elements.scanButton.disabled = false;
   }
+}
+
+async function runProgressiveScan(rootPath, options) {
+  elements.scanButton.disabled = true;
+  elements.exportButton.disabled = true;
+  state.result = null;
+  state.selectedNodeId = null;
+  state.hoveredNodeId = null;
+  setStatus("varredura progressiva", "busy");
+  startScanProgress("progressive");
+  resetSystemLog();
+  appendSystemLog("A.D.D progressivo iniciado; aguardando primeira profundidade.");
+  renderEmpty();
+
+  try {
+    const response = await fetch("/api/scan-progressive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rootPath, options })
+    });
+
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || `Falha HTTP ${response.status}`);
+    }
+    if (!response.body) {
+      throw new Error("Navegador sem suporte a leitura progressiva.");
+    }
+
+    await readProgressiveStream(response.body);
+    if (state.result) {
+      elements.exportButton.disabled = false;
+      syncOptionsFromResult();
+      finishScanProgress("ok", state.result);
+      setStatus(`ok - ${state.result.summary.elapsedMs} ms`, "ok");
+      appendSystemLog(`Varredura progressiva concluida: ${formatNumber(state.result.summary.files || 0)} arquivos, ${formatBytes(state.result.summary.totalBytes || 0)} analisados.`);
+    }
+  } catch (error) {
+    setStatus("erro na varredura", "error");
+    finishScanProgress("error");
+    appendSystemLog(`Erro: ${error.message}`);
+    renderError(error.message);
+  } finally {
+    elements.scanButton.disabled = false;
+  }
+}
+
+async function readProgressiveStream(body) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      processProgressiveLine(line);
+    }
+  }
+
+  if (buffer.trim()) {
+    processProgressiveLine(buffer);
+  }
+}
+
+function processProgressiveLine(line) {
+  if (!line.trim()) {
+    return;
+  }
+
+  const event = JSON.parse(line);
+  if (event.type === "error") {
+    throw new Error(event.error || "Erro na varredura progressiva.");
+  }
+  if (event.type === "heartbeat") {
+    updateHeartbeatProgress(event);
+    return;
+  }
+  if (event.type !== "snapshot" || !event.result) {
+    return;
+  }
+
+  state.result = event.result;
+  updateProgressiveScanProgress(event.progress || event.result.progressive || {}, event.result);
+  appendProgressiveSnapshotLog(event.progress || event.result.progressive || {}, event.result);
+  renderAll();
+}
+
+function updateHeartbeatProgress(event) {
+  if (!elements.scanProgress) {
+    return;
+  }
+  const elapsedMs = Number(event.elapsedMs || 0);
+  const scan = event.scan || {};
+  const depthText = event.currentDepth && event.maxDepth
+    ? `ultima prof. ${event.currentDepth}/${event.maxDepth}`
+    : "preparando varredura";
+  const scanText = scan.currentPath
+    ? `${formatNumber(scan.files || 0)} arquivos vistos em ${scan.currentPath}`
+    : depthText;
+  elements.scanProgress.classList.remove("is-hidden");
+  elements.scanProgress.dataset.mode = "busy";
+  elements.progressElapsed.textContent = formatElapsed(elapsedMs);
+  elements.progressLabel.textContent = `Processando: ${scanText}`;
+  appendSystemLog(`Ainda processando (${scanText})... ${formatElapsed(elapsedMs)} sem novo snapshot.`);
+}
+
+function appendProgressiveSnapshotLog(progress, result) {
+  const summary = result?.summary || {};
+  const are = result?.relocationPlan?.spaceModes?.alto?.reallocatableHuman || "0 B";
+  appendSystemLog(`Prof. ${progress.currentDepth || "?"}/${progress.maxDepth || "?"}: ${formatNumber(summary.files || 0)} arquivos, ${formatBytes(summary.totalBytes || 0)} lidos, A.R.E alto ${are}.`);
 }
 
 function syncOptionsFromResult() {
@@ -255,6 +395,9 @@ function syncOptionsFromResult() {
   elements.maxFiles.value = state.result.options.maxFiles;
   elements.maxDepth.value = state.result.options.maxDepth;
   elements.maxFileSize.value = state.result.options.maxFileSizeBytes;
+  if (elements.includeProgramFiles) {
+    elements.includeProgramFiles.checked = state.result.options.includeProgramFiles === true;
+  }
 }
 
 async function fetchJson(url, options) {
@@ -271,7 +414,7 @@ function setStatus(text, mode) {
   elements.serverStatus.dataset.mode = mode;
 }
 
-function startScanProgress() {
+function startScanProgress(mode = "normal") {
   if (!elements.scanProgress) {
     return;
   }
@@ -280,12 +423,19 @@ function startScanProgress() {
   state.scanProgressPercent = 4;
   elements.scanProgress.classList.remove("is-hidden");
   elements.scanProgress.dataset.mode = "busy";
-  elements.progressLabel.textContent = "Escaneando arquivos e diretorios";
+  elements.progressLabel.textContent = mode === "progressive"
+    ? "Iniciando varredura progressiva"
+    : "Escaneando arquivos e diretorios";
   elements.progressElapsed.textContent = "0.0s";
   elements.progressBar.style.width = "4%";
 
   if (state.scanProgressTimer) {
     window.clearInterval(state.scanProgressTimer);
+    state.scanProgressTimer = null;
+  }
+
+  if (mode === "progressive") {
+    return;
   }
 
   state.scanProgressTimer = window.setInterval(updateScanProgress, 180);
@@ -329,6 +479,25 @@ function finishScanProgress(mode, result) {
   }
 }
 
+function updateProgressiveScanProgress(progress, result) {
+  if (!elements.scanProgress) {
+    return;
+  }
+
+  const elapsedMs = state.scanProgressStartedAt ? performance.now() - state.scanProgressStartedAt : 0;
+  const percent = clamp(Number(progress.percent || 0), 0, 100);
+  const files = result?.summary?.files || 0;
+  const edges = result?.summary?.edges || 0;
+  const newNodes = Number(progress.newNodeCount || 0);
+  const newHuman = progress.newHuman || "0 B";
+  const depthText = `prof. ${progress.currentDepth || "?"}/${progress.maxDepth || "?"}`;
+  elements.scanProgress.classList.remove("is-hidden");
+  elements.scanProgress.dataset.mode = progress.isFinal ? "ok" : "busy";
+  elements.progressElapsed.textContent = formatElapsed(elapsedMs);
+  elements.progressBar.style.width = `${Math.max(4, percent)}%`;
+  elements.progressLabel.textContent = `${depthText}: ${formatNumber(files)} arquivos, ${formatNumber(edges)} arestas, +${formatNumber(newNodes)} novos (${newHuman})`;
+}
+
 function formatElapsed(ms) {
   const seconds = Math.max(0, ms / 1000);
   if (seconds < 60) {
@@ -340,7 +509,34 @@ function formatElapsed(ms) {
   return `${minutes}m ${remainingSeconds}s`;
 }
 
+function resetSystemLog() {
+  if (!elements.systemLogList) {
+    return;
+  }
+  elements.systemLogList.innerHTML = "";
+}
+
+function appendSystemLog(message) {
+  if (!elements.systemLogList) {
+    return;
+  }
+
+  const item = document.createElement("li");
+  const time = new Date().toLocaleTimeString("pt-BR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
+  item.textContent = `${time} - ${message}`;
+  elements.systemLogList.prepend(item);
+
+  while (elements.systemLogList.children.length > 80) {
+    elements.systemLogList.lastElementChild.remove();
+  }
+}
+
 function renderAll() {
+  syncDepthFilterOptions();
   renderMetrics();
   renderGraph();
   renderFiles();
@@ -349,6 +545,7 @@ function renderAll() {
   renderContinuousState();
   renderCycles();
   renderTextReport();
+  renderDepthTimeline();
   renderDependencies();
   renderWarnings();
   renderNodeDetails();
@@ -374,6 +571,8 @@ function renderEmpty() {
   if (elements.continuousState) elements.continuousState.innerHTML = "";
   if (elements.cyclesList) elements.cyclesList.innerHTML = empty("Nenhum ciclo detectado.");
   if (elements.textReport) elements.textReport.textContent = "";
+  if (elements.depthTimeline) elements.depthTimeline.innerHTML = empty("Nenhuma profundidade registrada.");
+  if (elements.depthFilter) elements.depthFilter.innerHTML = `<option value="all">Todas</option>`;
   elements.warningsList.innerHTML = empty("Sem avisos.");
   updateZoomLabel();
 }
@@ -389,6 +588,7 @@ function renderError(message) {
   if (elements.continuousState) elements.continuousState.innerHTML = "";
   if (elements.cyclesList) elements.cyclesList.innerHTML = empty(message);
   if (elements.textReport) elements.textReport.textContent = message;
+  if (elements.depthTimeline) elements.depthTimeline.innerHTML = empty(message);
   elements.warningsList.innerHTML = empty(message);
   clearCanvas(message);
 }
@@ -411,6 +611,20 @@ function renderMetrics() {
     [summary.byRisk.alto || 0, "alto risco"],
     [summary.staleCandidates || summary.candidateLowRisk, `candidatos - ${scale}`]
   ]);
+}
+
+function syncDepthFilterOptions() {
+  if (!elements.depthFilter || !state.result?.summary?.depthBreakdown) {
+    return;
+  }
+
+  const current = elements.depthFilter.value || "all";
+  const depths = state.result.summary.depthBreakdown.map((item) => String(item.depth));
+  elements.depthFilter.innerHTML = [
+    `<option value="all">Todas</option>`,
+    ...depths.map((depth) => `<option value="${escapeHtml(depth)}">Prof. ${escapeHtml(depth)}</option>`)
+  ].join("");
+  elements.depthFilter.value = depths.includes(current) ? current : "all";
 }
 
 function metricMarkup(items) {
@@ -588,6 +802,8 @@ function buildUiGroupNode(groupId, key, files, mode, expanded) {
     classification: "grupo",
     fileCount: files.length,
     directoryCount: new Set(files.map((file) => topDirectoryFromPath(file.relativePath))).size,
+    scanDepth: Math.max(0, ...files.map((file) => Number(file.scanDepth ?? 0))),
+    scanDepths: Array.from(new Set(files.map((file) => Number(file.scanDepth ?? 0)))).sort((a, b) => a - b),
     incoming,
     outgoing,
     impactCount,
@@ -651,9 +867,11 @@ function aggregateVisibleEdges(edges, fileToVisibleNode) {
 
 function selectGraphNodes(nodes, mode) {
   const filter = elements.graphFilter.value;
+  const depthFilter = elements.depthFilter?.value || "all";
   const query = elements.fileSearch.value.trim().toLowerCase();
   return nodes
     .filter((node) => filter === "all" || node.risk === filter)
+    .filter((node) => depthFilter === "all" || nodeMatchesDepth(node, depthFilter))
     .filter((node) => {
       if (!query) {
         return true;
@@ -673,6 +891,17 @@ function selectGraphNodes(nodes, mode) {
       return scoreB - scoreA || String(a.label).localeCompare(String(b.label));
     })
     .slice(0, mode.limit);
+}
+
+function nodeMatchesDepth(node, depthFilter) {
+  const depth = Number(depthFilter);
+  if (!Number.isFinite(depth)) {
+    return true;
+  }
+  if (Array.isArray(node.scanDepths)) {
+    return node.scanDepths.includes(depth);
+  }
+  return Number(node.scanDepth ?? 0) === depth;
 }
 
 function focusText() {
@@ -1097,8 +1326,10 @@ function renderFiles() {
   }
 
   const query = elements.fileSearch.value.trim().toLowerCase();
+  const depthFilter = elements.depthFilter?.value || "all";
   const rows = state.result.nodes
     .filter((node) => node.kind === "file")
+    .filter((node) => depthFilter === "all" || nodeMatchesDepth(node, depthFilter))
     .filter((node) => !query || node.relativePath.toLowerCase().includes(query))
     .sort((a, b) => {
       const riskDiff = riskWeight[b.risk] - riskWeight[a.risk];
@@ -1169,7 +1400,7 @@ function renderSimulation() {
     ["averiguar", "Averiguar", "incerteza, uso ou dependência moderada"],
     ["nao_apagar", "Não apagar", "sistema, uso recente ou impacto alto"]
   ];
-  const decisions = state.result.simulation.decisionGroups || {};
+  const decisions = state.result.simulation?.decisionGroups || buildDecisionGroupsFromNodes(state.result.nodes || []);
 
   elements.simulationGrid.innerHTML = groups.map(([key, title, subtitle]) => {
     const items = decisions[key] || [];
@@ -1190,6 +1421,29 @@ function renderSimulation() {
       </article>
     `;
   }).join("");
+}
+
+function buildDecisionGroupsFromNodes(nodes) {
+  const groups = {
+    pode_apagar: [],
+    inutil_provavel: [],
+    averiguar: [],
+    nao_apagar: []
+  };
+
+  for (const node of nodes.filter((item) => item.kind === "file")) {
+    const key = groups[node.deletionDecision] ? node.deletionDecision : "averiguar";
+    groups[key].push({
+      path: node.relativePath,
+      reason: (node.riskReasons || []).join(", ") || node.utilityStatus || "classificacao por metadados"
+    });
+  }
+
+  for (const items of Object.values(groups)) {
+    items.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  return groups;
 }
 
 function renderRelocationPlan() {
@@ -1240,6 +1494,7 @@ function renderAreModal(plan) {
   const modes = ["baixo", "medio", "alto"];
   return `
     ${renderAreSimulation(plan)}
+    ${renderAreDepthBreakdown(plan)}
     <section class="are-modal-summary">
       ${modes.map((modeKey) => {
         const mode = plan.spaceModes?.[modeKey] || {};
@@ -1264,6 +1519,52 @@ function renderAreModal(plan) {
     </section>
     ${modes.map((modeKey) => renderAreMode(plan.spaceModes?.[modeKey], modeKey)).join("")}
     ${renderBlockedFiles(plan.blockedFiles || [])}
+  `;
+}
+
+function renderAreDepthBreakdown(plan) {
+  const depths = plan.depthRelocation || [];
+  if (!depths.length) {
+    return "";
+  }
+
+  return `
+    <section class="are-simulation-board">
+      <div class="are-section-heading">
+        <div>
+          <h3>Realocacao por profundidade</h3>
+          <p class="muted">Cada linha soma a camada lida pelo A.D.D; o total do A.R.E usa todas as camadas acumuladas.</p>
+        </div>
+      </div>
+      <div class="table-wrap are-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Prof.</th>
+              <th>Arquivos</th>
+              <th>Total lido</th>
+              <th>Baixo</th>
+              <th>Medio</th>
+              <th>Alto</th>
+              <th>Bloqueado</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${depths.map((item) => `
+              <tr>
+                <td>${escapeHtml(item.depth)}</td>
+                <td>${formatNumber(item.files || 0)}</td>
+                <td>${escapeHtml(item.totalHuman || "0 B")}</td>
+                <td>${escapeHtml(item.reallocatableHuman?.baixo || "0 B")}</td>
+                <td>${escapeHtml(item.reallocatableHuman?.medio || "0 B")}</td>
+                <td>${escapeHtml(item.reallocatableHuman?.alto || "0 B")}</td>
+                <td>${escapeHtml(item.blockedHuman || "0 B")}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
   `;
 }
 
@@ -1487,6 +1788,45 @@ function renderContinuousState() {
     [summary.reanalysisNeeded ? "sim" : "nao", "reanalise"],
     [state.result.modules?.alc?.statePath ? "salvo" : "nao salvo", "estado"]
   ]);
+}
+
+function renderDepthTimeline() {
+  if (!state.result || !elements.depthTimeline) {
+    return;
+  }
+
+  const depths = state.result.summary?.depthBreakdown || [];
+  const relocationDepths = new Map((state.result.relocationPlan?.depthRelocation || []).map((item) => [Number(item.depth), item]));
+  if (!depths.length) {
+    elements.depthTimeline.innerHTML = empty("Nenhuma profundidade registrada.");
+    return;
+  }
+
+  elements.depthTimeline.innerHTML = depths.map((depth) => {
+    const relocation = relocationDepths.get(Number(depth.depth)) || {};
+    const high = relocation.reallocatableHuman?.alto || "0 B";
+    const medium = relocation.reallocatableHuman?.medio || "0 B";
+    const low = relocation.reallocatableHuman?.baixo || "0 B";
+    return `
+      <button class="depth-row" type="button" data-depth="${escapeHtml(depth.depth)}">
+        <span class="depth-index">Prof. ${escapeHtml(depth.depth)}</span>
+        <span>${formatNumber(depth.files)} arquivo(s)</span>
+        <strong>${escapeHtml(depth.human || "0 B")}</strong>
+        <small>ARE alto ${escapeHtml(high)} / medio ${escapeHtml(medium)} / baixo ${escapeHtml(low)}</small>
+      </button>
+    `;
+  }).join("");
+
+  elements.depthTimeline.querySelectorAll("[data-depth]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (!elements.depthFilter) {
+        return;
+      }
+      elements.depthFilter.value = String(button.dataset.depth);
+      renderGraph();
+      renderFiles();
+    });
+  });
 }
 
 function renderCycles() {

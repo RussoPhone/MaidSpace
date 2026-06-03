@@ -1,6 +1,7 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { classifyFileKnowledge, loadFileKnowledge } = require("./fileKnowledge");
+const { scanFastInventory } = require("../scan/fastInventory");
 
 const TEXT_EXTENSIONS = new Set([
   ".astro",
@@ -48,19 +49,64 @@ const SPECIAL_TEXT_FILES = new Set([
   "build.gradle"
 ]);
 
-const MAX_SCAN_FILES = 1500;
-const MAX_SCAN_DEPTH = 88;
+const MAX_SCAN_FILES = Infinity;
+const MAX_SCAN_DEPTH = Infinity;
+const DEFAULT_PROGRESSIVE_FILE_BUDGET = MAX_SCAN_FILES;
+const DEFAULT_HEAVY_FOLDER_BYTES = 2 * 1024 * 1024 * 1024;
 
 const DEFAULT_OPTIONS = {
   adaptive: true,
+  scanEngine: "turbo",
+  dependencyMode: "metadata",
+  fastScanMs: 20000,
+  fastStoredFiles: 25000,
+  fastStoredDirectories: 20000,
   maxFiles: MAX_SCAN_FILES,
   maxDepth: MAX_SCAN_DEPTH,
   maxFileSizeBytes: 512 * 1024,
   unusedDaysThreshold: loadFileKnowledge().recentUse?.unusedWindowDays || 30,
   frequentUseDaysThreshold: loadFileKnowledge().recentUse?.frequentWindowDays || 7,
   includeHidden: true,
+  includeProgramFiles: false,
+  sortEntries: false,
+  greedyScan: true,
+  skipReparsePoints: true,
+  maxScanMs: 0,
+  progressiveStepMaxMs: 10000,
+  maxDependencyReadBytes: 512 * 1024,
+  maxDependencyReadMs: 80,
+  targetedDfsProbe: true,
+  targetedDfsMaxFiles: 2000,
+  heavyFolderFileThreshold: 2500,
+  heavyFolderBytesThreshold: DEFAULT_HEAVY_FOLDER_BYTES,
+  heavyFolderRiskThreshold: 8,
   skipDirectories: [
     "$Recycle.Bin",
+    ".git",
+    ".hg",
+    ".next",
+    ".nuxt",
+    ".svn",
+    ".turbo",
+    ".vite",
+    ".vscode",
+    ".gradle",
+    ".pub-cache",
+    ".dartServer",
+    "AppData",
+    "bower_components",
+    "build",
+    "cache",
+    "caches",
+    "coverage",
+    "dart-sdk",
+    "dist",
+    "docs",
+    "flutter",
+    "gradle",
+    "node_modules",
+    "out",
+    "target",
     "Program Files",
     "Program Files (x86)",
     "ProgramData",
@@ -128,6 +174,9 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
   const fileNodes = [];
   const fileByKey = new Map();
   const rootsSeen = new Set();
+  const directoryFingerprints = new Set();
+  let stopReason = null;
+  let lastProgressAt = 0;
 
   let rootStat;
   try {
@@ -140,29 +189,344 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
     throw new Error(`O caminho informado nao e um diretorio: ${root}`);
   }
 
-  const scaleEstimate = await estimateDirectoryScale(root);
+  const wantsTurbo = shouldUseTurboScan(rawOptions);
+  const scaleEstimate = wantsTurbo
+    ? { scale: "massivo", sampledFiles: 0, sampledDirectories: 0, sampledEntries: 0, sampledDepth: 0, provider: "turbo" }
+    : await estimateDirectoryScale(root);
   const options = normalizeOptions(rawOptions, scaleEstimate);
+
+  if (options.scanEngine === "turbo") {
+    const inventory = await scanFastInventory(root, options, rawOptions.onScanProgress);
+    return buildAddReportFromCollectedNodes({
+      root,
+      rawOptions: {
+        ...rawOptions,
+        dependencyMode: "metadata",
+        skipGraphViews: rawOptions.skipGraphViews ?? true,
+        skipSimulation: rawOptions.skipSimulation ?? true
+      },
+      options,
+      scaleEstimate,
+      nodes: inventory.nodes,
+      fileNodes: inventory.fileNodes,
+      skipped: inventory.skipped,
+      warnings: inventory.warnings,
+      startedAt,
+      stopReason: inventory.stopReason,
+      inventoryStats: inventory.stats
+    });
+  }
+
   await walkDirectory(root, "", 0);
+  if (stopReason) {
+    warnings.push(stopReason);
+  }
+
+  return buildAddReportFromCollectedNodes({
+    root,
+    rawOptions,
+    options,
+    scaleEstimate,
+    nodes,
+    fileNodes,
+    skipped,
+    warnings,
+    startedAt,
+    stopReason
+  });
+
+  async function walkDirectory(absoluteDirectory, relativeDirectory, depth) {
+    const queue = [{ absoluteDirectory, relativeDirectory, depth }];
+    let queueIndex = 0;
+
+    while (queueIndex < queue.length) {
+      if (shouldStopScanning()) {
+        return;
+      }
+
+      const current = queue[queueIndex];
+      queueIndex += 1;
+
+      if (current.depth > options.maxDepth) {
+        skipped.push({
+          path: current.relativeDirectory || ".",
+          reason: `profundidade maior que ${options.maxDepth}`
+        });
+        continue;
+      }
+
+      const directoryKey = normalizeKey(current.relativeDirectory || ".");
+      if (rootsSeen.has(directoryKey)) {
+        continue;
+      }
+      rootsSeen.add(directoryKey);
+
+      let directoryStat;
+      try {
+        directoryStat = await fs.lstat(current.absoluteDirectory);
+      } catch (error) {
+        skipped.push({
+          path: current.relativeDirectory || ".",
+          reason: `sem metadados do diretorio: ${error.code || error.message}`
+        });
+        continue;
+      }
+
+      if (current.depth > 0 && options.skipReparsePoints && directoryStat.isSymbolicLink()) {
+        skipped.push({ path: current.relativeDirectory || ".", reason: "junction/link de diretorio ignorado" });
+        continue;
+      }
+
+      const fingerprint = directoryStat.dev || directoryStat.ino
+        ? `${directoryStat.dev}:${directoryStat.ino}`
+        : normalizeKey(current.absoluteDirectory);
+      if (directoryFingerprints.has(fingerprint)) {
+        skipped.push({ path: current.relativeDirectory || ".", reason: "diretorio ja visitado por outro caminho" });
+        continue;
+      }
+      directoryFingerprints.add(fingerprint);
+      emitScanProgress(current.relativeDirectory || ".", current.depth);
+
+      let entries;
+      try {
+        entries = await fs.readdir(current.absoluteDirectory, { withFileTypes: true });
+      } catch (error) {
+        skipped.push({
+          path: current.relativeDirectory || ".",
+          reason: `sem permissao de leitura: ${error.code || error.message}`
+        });
+        continue;
+      }
+
+      if (options.sortEntries) {
+        entries.sort((a, b) => a.name.localeCompare(b.name));
+      } else if (options.greedyScan) {
+        entries.sort((a, b) => entryScanPriority(a) - entryScanPriority(b));
+      }
+
+      for (const entry of entries) {
+        if (shouldStopScanning()) {
+          return;
+        }
+
+        if (fileNodes.length >= options.maxFiles) {
+          stopReason = `Limite de ${options.maxFiles} arquivos atingido; o restante foi ignorado.`;
+          return;
+        }
+
+        if (!options.includeHidden && entry.name.startsWith(".")) {
+          skipped.push({ path: normalizeRelative(path.join(current.relativeDirectory, entry.name)), reason: "oculto" });
+          continue;
+        }
+
+        const absolutePath = path.join(current.absoluteDirectory, entry.name);
+        const relativePath = normalizeRelative(path.join(current.relativeDirectory, entry.name));
+        const protectedReasons = getProtectedReasons(absolutePath, relativePath, entry.name, options);
+
+        if (entry.isSymbolicLink()) {
+          skipped.push({ path: relativePath, reason: "link simbolico ignorado" });
+          continue;
+        }
+
+        if (entry.isDirectory()) {
+          nodes.push({
+            id: `dir:${relativePath}`,
+            kind: "directory",
+            name: entry.name,
+            relativePath,
+            absolutePath,
+            scanDepth: current.depth + 1,
+            size: 0,
+            extension: "",
+            protectedReasons,
+            classification: protectedReasons.length ? "critico_protegido" : "diretorio",
+            risk: protectedReasons.length ? "alto" : "baixo"
+          });
+
+          if (shouldSkipDirectory(entry.name, protectedReasons, options)) {
+            skipped.push({ path: relativePath, reason: protectedReasons[0] || "diretorio pesado ou gerado" });
+            continue;
+          }
+
+          queue.push({ absoluteDirectory: absolutePath, relativeDirectory: relativePath, depth: current.depth + 1 });
+          continue;
+        }
+
+        if (!entry.isFile()) {
+          skipped.push({ path: relativePath, reason: "tipo de entrada nao suportado" });
+          continue;
+        }
+
+        let stat;
+        try {
+          stat = await fs.stat(absolutePath);
+        } catch (error) {
+          skipped.push({ path: relativePath, reason: `sem metadados: ${error.code || error.message}` });
+          continue;
+        }
+
+        const extension = path.extname(entry.name).toLowerCase();
+        const lowerName = entry.name.toLowerCase();
+        const fileKnowledge = classifyFileKnowledge(relativePath, entry.name, extension, {
+          size: stat.size,
+          modifiedAt: stat.mtime,
+          lastAccessedAt: stat.atime,
+          createdAt: stat.birthtime
+        });
+        const canReadContent = isTextCandidate(lowerName, extension) && stat.size <= options.maxFileSizeBytes;
+        const node = {
+          id: `file:${relativePath}`,
+          kind: "file",
+          name: entry.name,
+          relativePath,
+          absolutePath,
+          extension,
+          size: stat.size,
+          modifiedAt: stat.mtime.toISOString(),
+          lastAccessedAt: stat.atime.toISOString(),
+          createdAt: stat.birthtime.toISOString(),
+          daysSinceAccess: daysBetween(stat.atime, new Date()),
+          protectedReasons,
+          fileKnowledge,
+          dependencyGroup: fileKnowledge.dependencyGroup,
+          scanStrategy: {
+            discovery: "balanced_search_node",
+            inventoryProvider: "node",
+            dependencyGroup: fileKnowledge.dependencyGroup
+          },
+          dependencyProbe: {
+            enabled: false,
+            reason: null,
+            status: "not_needed"
+          },
+          incoming: 0,
+          outgoing: 0,
+          incomingFrom: [],
+          outgoingTo: [],
+          depth: 0,
+          scanDepth: current.depth,
+          impactCount: 0,
+          componentId: null,
+          componentSize: 1,
+          dfsColor: "branco",
+          inCycle: false,
+          cycleBlockId: null,
+          cycleBlockIds: [],
+          cycleGroupSize: 0,
+          dependsOn: [],
+          dependents: [],
+          classification: "isolado",
+          risk: "baixo",
+          riskScore: 0,
+          riskReasons: [],
+          impact: {
+            system: "desconhecido",
+            user: "desconhecido",
+            dependencies: "desconhecido"
+          },
+          utilityStatus: "desconhecido",
+          deletionDecision: "averiguar",
+          relocationDecision: "pode_mexer",
+          simulationAction: "separar_como_isolado",
+          simulation: null,
+          canReadContent,
+          readError: null,
+          detectedDependencies: [],
+          initialUnresolvedDependencies: 0,
+          initialUnresolvedSpecifiers: [],
+          unresolvedDependencies: 0,
+          unresolvedSpecifiers: [],
+          externalDependencies: 0
+        };
+
+        if (!canReadContent && isTextCandidate(lowerName, extension)) {
+          node.initialUnresolvedDependencies += 1;
+          node.initialUnresolvedSpecifiers.push({
+            specifier: "<arquivo grande>",
+            type: "conteudo_nao_lido",
+            line: null
+          });
+          node.unresolvedDependencies = node.initialUnresolvedDependencies;
+          node.unresolvedSpecifiers = [...node.initialUnresolvedSpecifiers];
+        }
+
+        nodes.push(node);
+        fileNodes.push(node);
+        fileByKey.set(normalizeKey(relativePath), node);
+        emitScanProgress(relativePath, current.depth);
+      }
+    }
+  }
+
+  function shouldStopScanning() {
+    if (stopReason) {
+      return true;
+    }
+    if (options.maxScanMs > 0 && Date.now() - startedAt >= options.maxScanMs) {
+      stopReason = `Orcamento de tempo da etapa atingido (${options.maxScanMs} ms); resultado parcial gerado.`;
+      return true;
+    }
+    return false;
+  }
+
+  function emitScanProgress(currentPath, depth) {
+    if (typeof rawOptions.onScanProgress !== "function") {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastProgressAt < 1000 && fileNodes.length % 1000 !== 0) {
+      return;
+    }
+    lastProgressAt = now;
+    rawOptions.onScanProgress({
+      currentPath,
+      depth,
+      files: fileNodes.length,
+      directories: nodes.filter((node) => node.kind === "directory").length,
+      totalBytes: fileNodes.reduce((sum, node) => sum + (node.size || 0), 0),
+      elapsedMs: now - startedAt,
+      stoppedEarly: Boolean(stopReason)
+    });
+  }
+}
+
+async function buildAddReportFromCollectedNodes({
+  root,
+  rawOptions,
+  options,
+  scaleEstimate,
+  nodes,
+  fileNodes,
+  skipped,
+  warnings,
+  startedAt,
+  stopReason = null,
+  inventoryStats = null
+}) {
+  const scanGrouping = prepareScanGrouping(fileNodes, inventoryStats, options);
+  resetAnalysisFields(fileNodes);
   const indexes = buildIndexes(fileNodes);
   const edges = [];
   const edgeKeys = new Set();
   const dependencyTypes = {};
+  const shouldParseDependencies = rawOptions.skipDependencyParsing !== true
+    && rawOptions.dependencyMode !== "metadata"
+    && options.dependencyMode !== "metadata";
+  const targetedProbeBudget = {
+    remaining: options.targetedDfsProbe ? options.targetedDfsMaxFiles : 0,
+    scheduled: 0,
+    skipped: 0
+  };
 
   for (const node of fileNodes) {
-    if (!node.canReadContent) {
+    const targetedProbe = shouldUseTargetedDfsProbe(node, options, targetedProbeBudget);
+    if ((!shouldParseDependencies && !targetedProbe) || (!node.canReadContent && !targetedProbe)) {
       continue;
     }
 
-    let content = "";
-    try {
-      content = await fs.readFile(node.absolutePath, "utf8");
-    } catch (error) {
-      node.readError = error.message;
-      node.unresolvedDependencies += 1;
-      continue;
-    }
-
-    const dependencies = extractDependencies(node.relativePath, content);
+    const dependencies = await readOrReuseDependencies(node, rawOptions._dependencyCache, options, {
+      targetedProbe
+    });
     node.detectedDependencies = dependencies;
 
     for (const dependency of dependencies) {
@@ -232,9 +596,17 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
           : "baixo";
   }
 
-  const summary = buildSummary(nodes, fileNodes, edges, components, cycles, skipped, warnings, startedAt);
-  const simulation = buildSimulation(fileNodes);
-  const graphViews = buildGraphViews(nodes, fileNodes, edges);
+  scanGrouping.targetedDfs = {
+    scheduled: targetedProbeBudget.scheduled,
+    skipped: targetedProbeBudget.skipped,
+    remainingBudget: targetedProbeBudget.remaining,
+    parsed: fileNodes.filter((node) => node.dependencyProbe?.status === "parsed").length,
+    partialReads: fileNodes.filter((node) => node.dependencyProbe?.partialRead).length
+  };
+
+  const summary = buildSummary(nodes, fileNodes, edges, components, cycles, skipped, warnings, startedAt, stopReason, inventoryStats, scanGrouping);
+  const simulation = rawOptions.skipSimulation ? null : buildSimulation(fileNodes);
+  const graphViews = rawOptions.skipGraphViews ? emptyGraphViews() : buildGraphViews(nodes, fileNodes, edges);
 
   return {
     schemaVersion: 1,
@@ -252,59 +624,507 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
     skipped,
     warnings
   };
+}
 
-  async function walkDirectory(absoluteDirectory, relativeDirectory, depth) {
-    if (depth > options.maxDepth) {
-      skipped.push({
-        path: relativeDirectory || ".",
-        reason: `profundidade maior que ${options.maxDepth}`
-      });
-      return;
+function prepareScanGrouping(fileNodes, inventoryStats, options = DEFAULT_OPTIONS) {
+  const heavyFolders = Array.isArray(inventoryStats?.heavyFolders) && inventoryStats.heavyFolders.length
+    ? inventoryStats.heavyFolders.slice(0, 100)
+    : buildHeavyFoldersFromNodes(fileNodes, options);
+  applyHeavyFolderMetadata(fileNodes, heavyFolders, options);
+
+  const dependencyGroups = Array.isArray(inventoryStats?.dependencyGroups) && inventoryStats.dependencyGroups.length
+    ? inventoryStats.dependencyGroups.slice(0, 200)
+    : buildDependencyGroupSummary(fileNodes).slice(0, 200);
+
+  return {
+    strategy: "balanced_search_horizontal_dpn",
+    heavyFolders,
+    dependencyGroups,
+    auxiliaryDatabase: inventoryStats?.auxiliaryDatabase || {
+      provider: inventoryStats?.provider || "node",
+      filesIndexed: fileNodes.length,
+      groupsIndexed: dependencyGroups.length,
+      heavyFoldersIndexed: heavyFolders.length
+    },
+    targetedDfs: {
+      scheduled: 0,
+      skipped: 0,
+      remainingBudget: options.targetedDfsMaxFiles,
+      parsed: 0,
+      partialReads: 0
+    }
+  };
+}
+
+function buildHeavyFoldersFromNodes(fileNodes, options = DEFAULT_OPTIONS) {
+  const folders = new Map();
+
+  for (const node of fileNodes) {
+    for (const folderPath of folderCandidatesFor(node.relativePath)) {
+      if (!folders.has(folderPath)) {
+        folders.set(folderPath, {
+          path: folderPath,
+          files: 0,
+          bytes: 0,
+          riskScore: 0,
+          categories: {},
+          dependencyGroups: {},
+          samples: []
+        });
+      }
+      const folder = folders.get(folderPath);
+      folder.files += 1;
+      folder.bytes += node.size || 0;
+      folder.riskScore += fileRiskWeight(node);
+      for (const category of node.fileKnowledge?.categories || []) {
+        folder.categories[category] = (folder.categories[category] || 0) + 1;
+      }
+      const dependencyGroup = node.dependencyGroup || node.fileKnowledge?.dependencyGroup || "dpn:incerto";
+      folder.dependencyGroups[dependencyGroup] = (folder.dependencyGroups[dependencyGroup] || 0) + 1;
+      if (folder.samples.length < 8) {
+        folder.samples.push(node.relativePath);
+      }
+    }
+  }
+
+  return Array.from(folders.values())
+    .filter((folder) => isHeavyFolder(folder, options))
+    .sort((a, b) => heavyFolderScore(b) - heavyFolderScore(a) || String(a.path).localeCompare(String(b.path)))
+    .slice(0, 100)
+    .map((folder) => ({
+      ...folder,
+      bytesHuman: formatBytes(folder.bytes),
+      reason: heavyFolderReason(folder, options),
+      topDependencyGroups: topEntries(folder.dependencyGroups, 6),
+      topCategories: topEntries(folder.categories, 6)
+    }));
+}
+
+function applyHeavyFolderMetadata(fileNodes, heavyFolders, options = DEFAULT_OPTIONS) {
+  const orderedFolders = (heavyFolders || [])
+    .slice()
+    .sort((a, b) => String(b.path || ".").length - String(a.path || ".").length);
+
+  for (const node of fileNodes) {
+    const folder = orderedFolders.find((candidate) => pathContainsFile(candidate.path || ".", node.relativePath));
+    if (folder) {
+      node.heavyFolder = {
+        path: folder.path,
+        files: folder.files,
+        bytes: folder.bytes,
+        bytesHuman: folder.bytesHuman || formatBytes(folder.bytes),
+        riskScore: folder.riskScore,
+        reason: folder.reason || heavyFolderReason(folder, options)
+      };
+    } else {
+      node.heavyFolder = null;
     }
 
-    const directoryKey = normalizeKey(relativeDirectory || ".");
+    node.dependencyGroup = node.dependencyGroup || node.fileKnowledge?.dependencyGroup || "dpn:incerto";
+    node.scanStrategy = {
+      ...(node.scanStrategy || {}),
+      discovery: node.scanStrategy?.discovery || "balanced_search_node",
+      dependencyGroup: node.dependencyGroup,
+      heavyFolderPath: node.heavyFolder?.path || null
+    };
+    node.dependencyProbe = dependencyProbeFor(node, options);
+  }
+}
+
+function dependencyProbeFor(node, options = DEFAULT_OPTIONS) {
+  if (!options.targetedDfsProbe) {
+    return { enabled: false, reason: "disabled", status: "not_needed" };
+  }
+  if (!node.heavyFolder) {
+    return { enabled: false, reason: "fora_de_hf", status: "not_needed" };
+  }
+
+  const lowerName = String(node.name || "").toLowerCase();
+  const textCandidate = isTextCandidate(lowerName, node.extension);
+  const knowledge = node.fileKnowledge || {};
+  const riskyDependency =
+    node.protectedReasons?.length > 0
+    || knowledge.isSystemEssential
+    || knowledge.isProjectDependency
+    || knowledge.isSourceCode
+    || knowledge.riskCategory === "dependencia"
+    || knowledge.riskCategory === "sistema";
+  const riskyHeavyFolder = (node.heavyFolder.riskScore || 0) >= options.heavyFolderRiskThreshold;
+
+  if (!textCandidate) {
+    return {
+      enabled: false,
+      reason: riskyDependency || riskyHeavyFolder ? "hf_risco_nao_texto" : "nao_texto",
+      status: "skipped_non_text"
+    };
+  }
+  if (!riskyDependency && !riskyHeavyFolder) {
+    return { enabled: false, reason: "hf_sem_dpn_de_risco", status: "not_needed" };
+  }
+
+  return {
+    enabled: true,
+    reason: riskyDependency ? "dpn_de_risco_em_hf" : "hf_risco_agregado",
+    status: "queued",
+    maxBytes: options.maxDependencyReadBytes,
+    maxMs: options.maxDependencyReadMs
+  };
+}
+
+function shouldUseTargetedDfsProbe(node, options, budget) {
+  if (!node.dependencyProbe?.enabled) {
+    if (node.dependencyProbe?.status === "skipped_non_text") {
+      budget.skipped += 1;
+    }
+    return false;
+  }
+  if (!options.targetedDfsProbe || budget.remaining <= 0) {
+    node.dependencyProbe.status = "budget_exhausted";
+    budget.skipped += 1;
+    return false;
+  }
+  budget.remaining -= 1;
+  budget.scheduled += 1;
+  node.dependencyProbe.status = "scheduled";
+  return true;
+}
+
+function buildDependencyGroupSummary(fileNodes) {
+  const groups = new Map();
+  for (const node of fileNodes) {
+    const key = node.dependencyGroup || node.fileKnowledge?.dependencyGroup || "dpn:incerto";
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        files: 0,
+        bytes: 0,
+        riskCategory: node.fileKnowledge?.riskCategory || "incerto",
+        typeCategory: node.fileKnowledge?.typeCategory || "desconhecido",
+        lastUseBucket: node.fileKnowledge?.lastUseBucket || "idade_desconhecida",
+        createdBucket: node.fileKnowledge?.createdBucket || "idade_desconhecida",
+        samples: []
+      });
+    }
+    const group = groups.get(key);
+    group.files += 1;
+    group.bytes += node.size || 0;
+    if (group.samples.length < 8) {
+      group.samples.push(node.relativePath);
+    }
+  }
+
+  return Array.from(groups.values())
+    .sort((a, b) => b.files - a.files || b.bytes - a.bytes || a.key.localeCompare(b.key))
+    .map((group) => ({
+      ...group,
+      bytesHuman: formatBytes(group.bytes)
+    }));
+}
+
+function folderCandidatesFor(relativePath) {
+  const normalized = normalizeRelative(relativePath);
+  const directory = normalizeRelative(path.posix.dirname(normalized));
+  const top = topDirectory(normalized);
+  return Array.from(new Set([
+    directory && directory !== "." ? directory : ".",
+    top || ".",
+    "."
+  ]));
+}
+
+function pathContainsFile(folderPath, relativePath) {
+  const folder = normalizeRelative(folderPath || ".");
+  const file = normalizeRelative(relativePath || ".");
+  return folder === "." || file === folder || file.startsWith(`${folder}/`);
+}
+
+function isHeavyFolder(folder, options = DEFAULT_OPTIONS) {
+  return (folder.files || 0) >= options.heavyFolderFileThreshold
+    || (folder.bytes || 0) >= options.heavyFolderBytesThreshold
+    || (folder.riskScore || 0) >= options.heavyFolderRiskThreshold;
+}
+
+function heavyFolderScore(folder) {
+  return ((folder.files || 0) * 1000) + Math.min(folder.bytes || 0, 1024 * 1024 * 1024 * 1024) + ((folder.riskScore || 0) * 100000);
+}
+
+function heavyFolderReason(folder, options = DEFAULT_OPTIONS) {
+  const reasons = [];
+  if ((folder.files || 0) >= options.heavyFolderFileThreshold) {
+    reasons.push("muitos_arquivos");
+  }
+  if ((folder.bytes || 0) >= options.heavyFolderBytesThreshold) {
+    reasons.push("muitos_bytes");
+  }
+  if ((folder.riskScore || 0) >= options.heavyFolderRiskThreshold) {
+    reasons.push("dpn_de_risco");
+  }
+  return reasons.join("+") || "amostragem_hf";
+}
+
+function fileRiskWeight(node) {
+  const knowledge = node.fileKnowledge || {};
+  let score = 0;
+  if (node.protectedReasons?.length) {
+    score += 8;
+  }
+  if (knowledge.isSystemEssential) {
+    score += 10;
+  }
+  if (knowledge.isProjectDependency || knowledge.isSourceCode) {
+    score += 6;
+  }
+  if (knowledge.isArchive || knowledge.riskCategory === "arquivo_pesado") {
+    score += 4;
+  }
+  if (knowledge.isLowValueGenerated) {
+    score += 2;
+  }
+  if ((node.size || 0) >= 1024 * 1024 * 1024) {
+    score += 4;
+  }
+  return score;
+}
+
+function topEntries(record, limit) {
+  return Object.entries(record || {})
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([key, count]) => ({ key, count }));
+}
+
+function resetAnalysisFields(fileNodes) {
+  for (const node of fileNodes) {
+    node.incoming = 0;
+    node.outgoing = 0;
+    node.incomingFrom = [];
+    node.outgoingTo = [];
+    node.depth = 0;
+    node.impactCount = 0;
+    node.componentId = null;
+    node.componentSize = 1;
+    node.dfsColor = "branco";
+    node.inCycle = false;
+    node.cycleBlockId = null;
+    node.cycleBlockIds = [];
+    node.cycleGroupSize = 0;
+    node.dependsOn = [];
+    node.dependents = [];
+    node.classification = "isolado";
+    node.risk = "baixo";
+    node.riskScore = 0;
+    node.riskReasons = [];
+    node.impact = {
+      system: "desconhecido",
+      user: "desconhecido",
+      dependencies: "desconhecido"
+    };
+    node.utilityStatus = "desconhecido";
+    node.deletionDecision = "averiguar";
+    node.relocationDecision = "pode_mexer";
+    node.simulationAction = "separar_como_isolado";
+    node.simulation = null;
+    node.detectedDependencies = [];
+    node.unresolvedDependencies = node.initialUnresolvedDependencies || 0;
+    node.unresolvedSpecifiers = [...(node.initialUnresolvedSpecifiers || [])];
+    node.externalDependencies = 0;
+  }
+}
+
+async function* analyzeDirectoryProgressive(rootPath, rawOptions = {}) {
+  const root = path.resolve(rootPath || process.cwd());
+  const startedAt = Date.now();
+  const warnings = [];
+  const skipped = [];
+  const nodes = [];
+  const fileNodes = [];
+  const rootsSeen = new Set();
+  const directoryFingerprints = new Set();
+  const seenFileIds = new Set();
+  const dependencyCache = new Map();
+  const queue = [{ absoluteDirectory: root, relativeDirectory: "", depth: 0 }];
+
+  let rootStat;
+  try {
+    rootStat = await fs.stat(root);
+  } catch (error) {
+    throw new Error(`Diretorio nao encontrado: ${root}`);
+  }
+
+  if (!rootStat.isDirectory()) {
+    throw new Error(`O caminho informado nao e um diretorio: ${root}`);
+  }
+
+  const wantsTurbo = shouldUseTurboScan(rawOptions);
+  const scaleEstimate = wantsTurbo
+    ? { scale: "massivo", sampledFiles: 0, sampledDirectories: 0, sampledEntries: 0, sampledDepth: 0, provider: "turbo" }
+    : await estimateDirectoryScale(root);
+  const baseOptions = normalizeOptions(rawOptions, scaleEstimate);
+
+  if (baseOptions.scanEngine === "turbo") {
+    const inventory = await scanFastInventory(root, baseOptions, rawOptions.onScanProgress);
+    const addReport = await buildAddReportFromCollectedNodes({
+      root,
+      rawOptions: {
+        ...rawOptions,
+        dependencyMode: "metadata",
+        skipGraphViews: true,
+        skipSimulation: true
+      },
+      options: {
+        ...baseOptions,
+        skipGraphViews: true,
+        skipSimulation: true
+      },
+      scaleEstimate,
+      nodes: inventory.nodes,
+      fileNodes: inventory.fileNodes,
+      skipped: inventory.skipped,
+      warnings: inventory.warnings,
+      startedAt,
+      stopReason: inventory.stopReason,
+      inventoryStats: inventory.stats
+    });
+    addReport.progressive = {
+      enabled: true,
+      experimental: false,
+      singlePass: true,
+      turbo: true,
+      provider: inventory.provider,
+      step: 1,
+      totalSteps: 1,
+      currentDepth: baseOptions.maxDepth,
+      minDepth: 1,
+      maxDepth: baseOptions.maxDepth,
+      fileBudget: baseOptions.maxFiles,
+      percent: 100,
+      queueRemaining: 0,
+      newNodeCount: addReport.nodes.filter((node) => node.kind === "file").length,
+      newBytes: addReport.summary.totalBytes,
+      newHuman: addReport.summary.totalHuman,
+      cumulativeBytes: addReport.summary.totalBytes,
+      cumulativeHuman: addReport.summary.totalHuman,
+      depthBreakdown: addReport.summary.depthBreakdown,
+      depthMemory: addReport.summary.depthBreakdown,
+      newNodes: addReport.nodes.filter((node) => node.kind === "file").map((node) => node.relativePath).slice(0, 30),
+      stoppedEarly: addReport.summary.stoppedEarly,
+      stopReason: addReport.summary.stopReason,
+      isFinal: true
+    };
+    yield addReport;
+    return;
+  }
+
+  const minDepth = clampInteger(rawOptions.progressiveMinDepth ?? 1, 1, baseOptions.maxDepth, 1);
+  const maxDepth = baseOptions.maxDepth;
+  const fileBudget = clampInteger(
+    rawOptions.progressiveMaxFiles ?? baseOptions.maxFiles,
+    100,
+    baseOptions.maxFiles,
+    baseOptions.maxFiles
+  );
+  const sliceMs = baseOptions.progressiveStepMaxMs;
+  const reportOptions = {
+    ...baseOptions,
+    adaptive: false,
+    maxDepth,
+    maxFiles: fileBudget,
+    saveState: false,
+    skipGraphViews: true,
+    skipSimulation: true
+  };
+  let queueIndex = 0;
+  let step = 0;
+  let currentDepth = 0;
+  let lastSnapshotAt = Date.now();
+  let stopReason = null;
+
+  while (queueIndex < queue.length && !stopReason) {
+    const current = queue[queueIndex];
+    queueIndex += 1;
+    currentDepth = Math.max(currentDepth, current.depth);
+
+    if (current.depth > maxDepth) {
+      skipped.push({ path: current.relativeDirectory || ".", reason: `profundidade maior que ${maxDepth}` });
+      continue;
+    }
+
+    if (current.depth >= minDepth) {
+      rawOptions.onScanProgress?.({
+        currentPath: current.relativeDirectory || ".",
+        depth: current.depth,
+        files: fileNodes.length,
+        directories: nodes.filter((node) => node.kind === "directory").length,
+        totalBytes: fileNodes.reduce((sum, node) => sum + (node.size || 0), 0),
+        elapsedMs: Date.now() - startedAt,
+        queueRemaining: Math.max(0, queue.length - queueIndex)
+      });
+    }
+
+    const directoryKey = normalizeKey(current.relativeDirectory || ".");
     if (rootsSeen.has(directoryKey)) {
-      return;
+      continue;
     }
     rootsSeen.add(directoryKey);
 
-    let entries;
+    let directoryStat;
     try {
-      entries = await fs.readdir(absoluteDirectory, { withFileTypes: true });
+      directoryStat = await fs.lstat(current.absoluteDirectory);
     } catch (error) {
       skipped.push({
-        path: relativeDirectory || ".",
-        reason: `sem permissao de leitura: ${error.code || error.message}`
+        path: current.relativeDirectory || ".",
+        reason: `sem metadados do diretorio: ${error.code || error.message}`
       });
-      return;
+      continue;
     }
 
-    entries.sort((a, b) => a.name.localeCompare(b.name));
+    if (current.depth > 0 && reportOptions.skipReparsePoints && directoryStat.isSymbolicLink()) {
+      skipped.push({ path: current.relativeDirectory || ".", reason: "junction/link de diretorio ignorado" });
+      continue;
+    }
+
+    const fingerprint = directoryStat.dev || directoryStat.ino
+      ? `${directoryStat.dev}:${directoryStat.ino}`
+      : normalizeKey(current.absoluteDirectory);
+    if (directoryFingerprints.has(fingerprint)) {
+      skipped.push({ path: current.relativeDirectory || ".", reason: "diretorio ja visitado por outro caminho" });
+      continue;
+    }
+    directoryFingerprints.add(fingerprint);
+
+    let entries;
+    try {
+      entries = await fs.readdir(current.absoluteDirectory, { withFileTypes: true });
+    } catch (error) {
+      skipped.push({
+        path: current.relativeDirectory || ".",
+        reason: `sem permissao de leitura: ${error.code || error.message}`
+      });
+      continue;
+    }
+
+    if (reportOptions.sortEntries) {
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+    } else if (reportOptions.greedyScan) {
+      entries.sort((a, b) => entryScanPriority(a) - entryScanPriority(b));
+    }
 
     for (const entry of entries) {
-      if (fileNodes.length >= options.maxFiles) {
-        warnings.push(`Limite de ${options.maxFiles} arquivos atingido; o restante foi ignorado.`);
-        return;
+      if (fileNodes.length >= fileBudget) {
+        stopReason = `Limite de ${fileBudget} arquivos atingido; o restante foi ignorado.`;
+        break;
       }
 
-      if (!options.includeHidden && entry.name.startsWith(".")) {
-        skipped.push({ path: normalizeRelative(path.join(relativeDirectory, entry.name)), reason: "oculto" });
+      if (!reportOptions.includeHidden && entry.name.startsWith(".")) {
+        skipped.push({ path: normalizeRelative(path.join(current.relativeDirectory, entry.name)), reason: "oculto" });
         continue;
       }
 
-      const absolutePath = path.join(absoluteDirectory, entry.name);
-      const relativePath = normalizeRelative(path.join(relativeDirectory, entry.name));
-      const protectedReasons = getProtectedReasons(absolutePath, relativePath, entry.name);
+      const absolutePath = path.join(current.absoluteDirectory, entry.name);
+      const relativePath = normalizeRelative(path.join(current.relativeDirectory, entry.name));
+      const protectedReasons = getProtectedReasons(absolutePath, relativePath, entry.name, reportOptions);
 
-      let stat;
-      try {
-        stat = await fs.lstat(absolutePath);
-      } catch (error) {
-        skipped.push({ path: relativePath, reason: `sem metadados: ${error.code || error.message}` });
-        continue;
-      }
-
-      if (stat.isSymbolicLink()) {
+      if (entry.isSymbolicLink()) {
         skipped.push({ path: relativePath, reason: "link simbolico ignorado" });
         continue;
       }
@@ -316,6 +1136,7 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
           name: entry.name,
           relativePath,
           absolutePath,
+          scanDepth: current.depth + 1,
           size: 0,
           extension: "",
           protectedReasons,
@@ -323,12 +1144,12 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
           risk: protectedReasons.length ? "alto" : "baixo"
         });
 
-        if (shouldSkipDirectory(entry.name, protectedReasons, options)) {
+        if (shouldSkipDirectory(entry.name, protectedReasons, reportOptions)) {
           skipped.push({ path: relativePath, reason: protectedReasons[0] || "diretorio pesado ou gerado" });
           continue;
         }
 
-        await walkDirectory(absolutePath, relativePath, depth + 1);
+        queue.push({ absoluteDirectory: absolutePath, relativeDirectory: relativePath, depth: current.depth + 1 });
         continue;
       }
 
@@ -337,10 +1158,23 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
         continue;
       }
 
+      let stat;
+      try {
+        stat = await fs.stat(absolutePath);
+      } catch (error) {
+        skipped.push({ path: relativePath, reason: `sem metadados: ${error.code || error.message}` });
+        continue;
+      }
+
       const extension = path.extname(entry.name).toLowerCase();
       const lowerName = entry.name.toLowerCase();
-      const fileKnowledge = classifyFileKnowledge(relativePath, entry.name, extension);
-      const canReadContent = isTextCandidate(lowerName, extension) && stat.size <= options.maxFileSizeBytes;
+      const fileKnowledge = classifyFileKnowledge(relativePath, entry.name, extension, {
+        size: stat.size,
+        modifiedAt: stat.mtime,
+        lastAccessedAt: stat.atime,
+        createdAt: stat.birthtime
+      });
+      const canReadContent = isTextCandidate(lowerName, extension) && stat.size <= reportOptions.maxFileSizeBytes;
       const node = {
         id: `file:${relativePath}`,
         kind: "file",
@@ -351,14 +1185,27 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
         size: stat.size,
         modifiedAt: stat.mtime.toISOString(),
         lastAccessedAt: stat.atime.toISOString(),
+        createdAt: stat.birthtime.toISOString(),
         daysSinceAccess: daysBetween(stat.atime, new Date()),
         protectedReasons,
         fileKnowledge,
+        dependencyGroup: fileKnowledge.dependencyGroup,
+        scanStrategy: {
+          discovery: "balanced_search_node",
+          inventoryProvider: "node",
+          dependencyGroup: fileKnowledge.dependencyGroup
+        },
+        dependencyProbe: {
+          enabled: false,
+          reason: null,
+          status: "not_needed"
+        },
         incoming: 0,
         outgoing: 0,
         incomingFrom: [],
         outgoingTo: [],
         depth: 0,
+        scanDepth: current.depth,
         impactCount: 0,
         componentId: null,
         componentSize: 1,
@@ -386,24 +1233,96 @@ async function analyzeDirectory(rootPath, rawOptions = {}) {
         canReadContent,
         readError: null,
         detectedDependencies: [],
+        initialUnresolvedDependencies: 0,
+        initialUnresolvedSpecifiers: [],
         unresolvedDependencies: 0,
         unresolvedSpecifiers: [],
         externalDependencies: 0
       };
 
       if (!canReadContent && isTextCandidate(lowerName, extension)) {
-        node.unresolvedDependencies += 1;
-        node.unresolvedSpecifiers.push({
+        node.initialUnresolvedDependencies += 1;
+        node.initialUnresolvedSpecifiers.push({
           specifier: "<arquivo grande>",
           type: "conteudo_nao_lido",
           line: null
         });
+        node.unresolvedDependencies = node.initialUnresolvedDependencies;
+        node.unresolvedSpecifiers = [...node.initialUnresolvedSpecifiers];
       }
 
       nodes.push(node);
       fileNodes.push(node);
-      fileByKey.set(normalizeKey(relativePath), node);
+
+      if (Date.now() - lastSnapshotAt >= sliceMs) {
+        step += 1;
+        lastSnapshotAt = Date.now();
+        yield await buildProgressiveSnapshot(false);
+      }
     }
+  }
+
+  if (stopReason) {
+    warnings.push(stopReason);
+  }
+  step += 1;
+  yield await buildProgressiveSnapshot(true);
+
+  async function buildProgressiveSnapshot(isFinal) {
+    const addReport = await buildAddReportFromCollectedNodes({
+      root,
+      rawOptions: {
+        ...rawOptions,
+        skipGraphViews: true,
+        skipSimulation: true,
+        _dependencyCache: dependencyCache
+      },
+      options: reportOptions,
+      scaleEstimate,
+      nodes,
+      fileNodes,
+      skipped,
+      warnings,
+      startedAt,
+      stopReason
+    });
+    const fileIds = addReport.nodes
+      .filter((node) => node.kind === "file")
+      .map((node) => node.id);
+    const newFileIds = fileIds.filter((id) => !seenFileIds.has(id));
+    const newNodes = addReport.nodes.filter((node) => newFileIds.includes(node.id));
+    for (const id of fileIds) {
+      seenFileIds.add(id);
+    }
+    const processedDirectories = queueIndex;
+    const totalKnownDirectories = Math.max(1, queue.length);
+
+    addReport.progressive = {
+      enabled: true,
+      experimental: true,
+      singlePass: true,
+      step,
+      totalSteps: null,
+      currentDepth,
+      minDepth,
+      maxDepth,
+      fileBudget,
+      percent: isFinal ? 100 : Math.min(99, Math.round((processedDirectories / totalKnownDirectories) * 100)),
+      queueRemaining: Math.max(0, queue.length - queueIndex),
+      newNodeCount: newFileIds.length,
+      newBytes: newNodes.reduce((sum, node) => sum + (node.size || 0), 0),
+      newHuman: formatBytes(newNodes.reduce((sum, node) => sum + (node.size || 0), 0)),
+      cumulativeBytes: addReport.summary.totalBytes,
+      cumulativeHuman: formatBytes(addReport.summary.totalBytes),
+      depthBreakdown: addReport.summary.depthBreakdown,
+      depthMemory: addReport.summary.depthBreakdown,
+      newNodes: newNodes.map((node) => node.relativePath).slice(0, 30),
+      stoppedEarly: addReport.summary.stoppedEarly,
+      stopReason: addReport.summary.stopReason,
+      isFinal
+    };
+
+    return addReport;
   }
 }
 
@@ -476,14 +1395,69 @@ function normalizeOptions(rawOptions, scaleEstimate = { scale: "medio" }) {
   };
 
   options.adaptive = adaptive;
+  options.scanEngine = normalizeScanEngine(options.scanEngine);
+  options.dependencyMode = options.dependencyMode === "full" ? "full" : "metadata";
   options.maxFiles = clampInteger(options.maxFiles, 100, MAX_SCAN_FILES, DEFAULT_OPTIONS.maxFiles);
   options.maxDepth = clampInteger(options.maxDepth, 1, MAX_SCAN_DEPTH, DEFAULT_OPTIONS.maxDepth);
   options.maxFileSizeBytes = clampInteger(options.maxFileSizeBytes, 16 * 1024, 5 * 1024 * 1024, DEFAULT_OPTIONS.maxFileSizeBytes);
+  options.maxDependencyReadBytes = clampInteger(
+    options.maxDependencyReadBytes,
+    4 * 1024,
+    5 * 1024 * 1024,
+    Math.min(DEFAULT_OPTIONS.maxDependencyReadBytes, options.maxFileSizeBytes)
+  );
+  options.maxDependencyReadMs = clampInteger(options.maxDependencyReadMs, 10, 5000, DEFAULT_OPTIONS.maxDependencyReadMs);
+  options.targetedDfsProbe = options.targetedDfsProbe !== false;
+  options.targetedDfsMaxFiles = clampInteger(options.targetedDfsMaxFiles, 0, 50000, DEFAULT_OPTIONS.targetedDfsMaxFiles);
+  options.heavyFolderFileThreshold = clampInteger(
+    options.heavyFolderFileThreshold,
+    1,
+    MAX_SCAN_FILES,
+    DEFAULT_OPTIONS.heavyFolderFileThreshold
+  );
+  options.heavyFolderBytesThreshold = clampInteger(
+    options.heavyFolderBytesThreshold,
+    0,
+    1024 * 1024 * 1024 * 1024,
+    DEFAULT_OPTIONS.heavyFolderBytesThreshold
+  );
+  options.heavyFolderRiskThreshold = clampInteger(options.heavyFolderRiskThreshold, 0, 100000, DEFAULT_OPTIONS.heavyFolderRiskThreshold);
+  options.fastScanMs = clampInteger(options.fastScanMs, 1000, 10 * 60 * 1000, DEFAULT_OPTIONS.fastScanMs);
+  options.fastStoredFiles = clampInteger(options.fastStoredFiles, 1000, 500000, DEFAULT_OPTIONS.fastStoredFiles);
+  options.fastStoredDirectories = clampInteger(options.fastStoredDirectories, 500, 100000, DEFAULT_OPTIONS.fastStoredDirectories);
   options.unusedDaysThreshold = clampInteger(options.unusedDaysThreshold, 1, 3650, DEFAULT_OPTIONS.unusedDaysThreshold);
   options.frequentUseDaysThreshold = clampInteger(options.frequentUseDaysThreshold, 1, 60, DEFAULT_OPTIONS.frequentUseDaysThreshold);
   options.skipDirectories = Array.from(new Set([...(DEFAULT_OPTIONS.skipDirectories || []), ...((rawOptions && rawOptions.skipDirectories) || [])]));
+  options.includeProgramFiles = Boolean(options.includeProgramFiles);
+  if (options.includeProgramFiles) {
+    options.skipDirectories = options.skipDirectories.filter((item) => !isProgramFilesName(item));
+  }
   options.includeHidden = Boolean(options.includeHidden);
+  options.sortEntries = Boolean(options.sortEntries);
+  options.greedyScan = options.greedyScan !== false;
+  options.skipReparsePoints = options.skipReparsePoints !== false;
+  options.maxScanMs = clampInteger(options.maxScanMs, 0, 24 * 60 * 60 * 1000, DEFAULT_OPTIONS.maxScanMs);
+  options.progressiveStepMaxMs = clampInteger(
+    options.progressiveStepMaxMs,
+    1000,
+    30 * 60 * 1000,
+    DEFAULT_OPTIONS.progressiveStepMaxMs
+  );
+  delete options._dependencyCache;
+  delete options.onScanProgress;
   return options;
+}
+
+function shouldUseTurboScan(rawOptions = {}) {
+  return normalizeScanEngine(rawOptions.scanEngine ?? DEFAULT_OPTIONS.scanEngine) === "turbo";
+}
+
+function normalizeScanEngine(value) {
+  const engine = String(value || "turbo").toLowerCase();
+  if (["node", "preciso", "deep", "full"].includes(engine)) {
+    return "node";
+  }
+  return "turbo";
 }
 
 function adaptiveProfile(scale) {
@@ -515,6 +1489,28 @@ function adaptiveProfile(scale) {
   };
 }
 
+function buildProgressiveDepthSteps(minDepth, maxDepth) {
+  const start = Math.max(1, minDepth);
+  const end = Math.max(start, maxDepth);
+  const steps = new Set([start, end]);
+
+  if (end - start <= 10) {
+    for (let depth = start; depth <= end; depth += 1) {
+      steps.add(depth);
+    }
+  } else {
+    for (let depth = start; depth <= Math.min(end, start + 4); depth += 1) {
+      steps.add(depth);
+    }
+    const stride = Math.max(2, Math.ceil((end - start) / 10));
+    for (let depth = start + stride; depth < end; depth += stride) {
+      steps.add(depth);
+    }
+  }
+
+  return Array.from(steps).sort((a, b) => a - b);
+}
+
 function clampInteger(value, min, max, fallback) {
   const parsed = Number.parseInt(value, 10);
   if (Number.isNaN(parsed)) {
@@ -534,10 +1530,36 @@ function daysBetween(date, now) {
 function shouldSkipDirectory(name, protectedReasons, options) {
   const lowerName = name.toLowerCase();
   const skipNames = new Set(options.skipDirectories.map((item) => item.toLowerCase()));
+  if (options.includeProgramFiles && isProgramFilesName(lowerName)) {
+    return false;
+  }
   return skipNames.has(lowerName) || protectedReasons.some((reason) => reason.includes("diretorio do sistema"));
 }
 
-function getProtectedReasons(absolutePath, relativePath, name) {
+function entryScanPriority(entry) {
+  const name = String(entry.name || "").toLowerCase();
+  if (entry.isDirectory()) {
+    if (/^(downloads|desktop|documents|videos|pictures|music)$/i.test(name)) {
+      return 0;
+    }
+    if (/^(temp|tmp|cache|caches|logs|backups|backup|old|archive|archives)$/i.test(name)) {
+      return 1;
+    }
+    if (/^(\.git|node_modules|appdata|programdata|windows|system32|winsxs)$/i.test(name)) {
+      return 20;
+    }
+    return 4;
+  }
+  if (/\.(zip|7z|rar|iso|msi|exe|mp4|mov|mkv|avi|bak|old|tmp|log)$/i.test(name)) {
+    return 2;
+  }
+  if (/\.(dll|sys|dat|db|sqlite|lock|json|js|ts|py|css|html)$/i.test(name)) {
+    return 8;
+  }
+  return 5;
+}
+
+function getProtectedReasons(absolutePath, relativePath, name, options = DEFAULT_OPTIONS) {
   const reasons = [];
   const lowerAbsolute = absolutePath.toLowerCase();
   const lowerRelative = normalizeRelative(relativePath).toLowerCase();
@@ -564,11 +1586,15 @@ function getProtectedReasons(absolutePath, relativePath, name) {
     reasons.push("metadados de versionamento");
   }
 
-  if (/(^|[\\/])(windows|system32|winsxs|windowsapps|program files|program files \(x86\)|programdata|recovery|system volume information|\$recycle\.bin)([\\/]|$)/i.test(absolutePath)) {
+  if (/(^|[\\/])(windows|system32|winsxs|windowsapps|programdata|recovery|system volume information|\$recycle\.bin)([\\/]|$)/i.test(absolutePath)) {
     reasons.push("diretorio do sistema operacional");
   }
 
-  if (/(^|\/)(windows|system32|winsxs|windowsapps|program files|program files \(x86\)|programdata|recovery|system volume information|\$recycle\.bin)(\/|$)/i.test(lowerRelative)) {
+  if (/(^|\/)(windows|system32|winsxs|windowsapps|programdata|recovery|system volume information|\$recycle\.bin)(\/|$)/i.test(lowerRelative)) {
+    reasons.push("diretorio do sistema operacional");
+  }
+
+  if (!options.includeProgramFiles && isProgramFilesPath(lowerAbsolute, lowerRelative)) {
     reasons.push("diretorio do sistema operacional");
   }
 
@@ -577,6 +1603,16 @@ function getProtectedReasons(absolutePath, relativePath, name) {
   }
 
   return Array.from(new Set(reasons));
+}
+
+function isProgramFilesName(name) {
+  const lowerName = String(name || "").toLowerCase();
+  return lowerName === "program files" || lowerName === "program files (x86)";
+}
+
+function isProgramFilesPath(absolutePath, relativePath) {
+  return /(^|[\\/])program files( \(x86\))?([\\/]|$)/i.test(absolutePath)
+    || /(^|\/)program files( \(x86\))?(\/|$)/i.test(relativePath);
 }
 
 function isTextCandidate(lowerName, extension) {
@@ -598,6 +1634,98 @@ function buildIndexes(fileNodes) {
   }
 
   return { byRelative, byBasename };
+}
+
+async function readOrReuseDependencies(node, dependencyCache, options = DEFAULT_OPTIONS, { targetedProbe = false } = {}) {
+  const maxBytes = Math.min(
+    Math.max(4096, options.maxDependencyReadBytes || DEFAULT_OPTIONS.maxDependencyReadBytes),
+    Math.max(4096, node.size || options.maxDependencyReadBytes || DEFAULT_OPTIONS.maxDependencyReadBytes)
+  );
+  const cacheKey = `${node.relativePath}|${node.size}|${node.modifiedAt}|${maxBytes}`;
+  const cached = dependencyCache?.get(cacheKey);
+
+  if (cached) {
+    if (cached.readError) {
+      node.readError = cached.readError;
+      node.unresolvedDependencies += 1;
+      return [];
+    }
+    applyDependencyReadMetadata(node, cached.readMeta, targetedProbe, options);
+    return cached.dependencies;
+  }
+
+  let readResult;
+  try {
+    readResult = await readTextPrefix(node.absolutePath, maxBytes);
+  } catch (error) {
+    const readError = error.message;
+    node.readError = readError;
+    node.unresolvedDependencies += 1;
+    dependencyCache?.set(cacheKey, { readError, dependencies: [] });
+    return [];
+  }
+
+  const readMeta = {
+    bytesRead: readResult.bytesRead,
+    maxBytes,
+    elapsedMs: readResult.elapsedMs,
+    truncated: Boolean((node.size || 0) > readResult.bytesRead)
+  };
+  applyDependencyReadMetadata(node, readMeta, targetedProbe, options);
+  const dependencies = extractDependencies(node.relativePath, readResult.content);
+  dependencyCache?.set(cacheKey, { readError: null, dependencies, readMeta });
+  return dependencies;
+}
+
+async function readTextPrefix(absolutePath, maxBytes) {
+  const startedAt = Date.now();
+  const handle = await fs.open(absolutePath, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    return {
+      content: buffer.subarray(0, bytesRead).toString("utf8"),
+      bytesRead,
+      elapsedMs: Date.now() - startedAt
+    };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+function applyDependencyReadMetadata(node, readMeta, targetedProbe, options = DEFAULT_OPTIONS) {
+  if (!readMeta) {
+    return;
+  }
+
+  node.dependencyRead = readMeta;
+  if (node.dependencyProbe) {
+    node.dependencyProbe.status = "parsed";
+    node.dependencyProbe.bytesRead = readMeta.bytesRead;
+    node.dependencyProbe.maxBytes = readMeta.maxBytes;
+    node.dependencyProbe.elapsedMs = readMeta.elapsedMs;
+    node.dependencyProbe.partialRead = readMeta.truncated;
+  }
+
+  if (readMeta.truncated) {
+    node.unresolvedDependencies += 1;
+    node.unresolvedSpecifiers.push({
+      specifier: "<conteudo_parcial>",
+      type: targetedProbe ? "dfs_probe_limitado" : "conteudo_parcial",
+      line: null
+    });
+  }
+  if (readMeta.elapsedMs > options.maxDependencyReadMs) {
+    if (node.dependencyProbe) {
+      node.dependencyProbe.timeLimitExceeded = true;
+    }
+    node.unresolvedDependencies += 1;
+    node.unresolvedSpecifiers.push({
+      specifier: "<tempo_limite_leitura>",
+      type: targetedProbe ? "dfs_probe_timeout" : "leitura_timeout",
+      line: null
+    });
+  }
 }
 
 function extractDependencies(relativePath, content) {
@@ -1370,24 +2498,53 @@ function deletionDecisionFor(node, context) {
   return "averiguar";
 }
 
-function buildSummary(nodes, fileNodes, edges, components, cycles, skipped, warnings, startedAt) {
+function buildSummary(nodes, fileNodes, edges, components, cycles, skipped, warnings, startedAt, stopReason = null, inventoryStats = null, scanGrouping = null) {
   const byClassification = countBy(fileNodes, "classification");
   const byRisk = countBy(fileNodes, "risk");
   const byDeletionDecision = countBy(fileNodes, "deletionDecision");
   const byUtilityStatus = countBy(fileNodes, "utilityStatus");
-  const directories = nodes.filter((node) => node.kind === "directory").length;
+  const storedDirectories = nodes.filter((node) => node.kind === "directory").length;
+  const directories = inventoryStats?.directories ?? storedDirectories;
+  const storedBytes = fileNodes.reduce((sum, node) => sum + (node.size || 0), 0);
+  const totalBytes = inventoryStats?.totalBytes ?? storedBytes;
+  const totalFiles = inventoryStats?.files ?? fileNodes.length;
+  const depthBreakdown = buildDepthBreakdown(fileNodes);
   return {
     scannedAt: new Date().toISOString(),
     elapsedMs: Date.now() - startedAt,
     directories,
-    files: fileNodes.length,
-    entries: directories + fileNodes.length,
+    storedDirectories,
+    files: totalFiles,
+    analyzedFiles: fileNodes.length,
+    storedFiles: fileNodes.length,
+    totalBytes,
+    totalHuman: formatBytes(totalBytes),
+    storedBytes,
+    storedHuman: formatBytes(storedBytes),
+    inventoryProvider: inventoryStats?.provider || "node",
+    inventoryTruncated: Boolean(inventoryStats?.truncated),
+    scanStrategy: scanGrouping?.strategy || "balanced_search_horizontal_dpn",
+    auxiliaryDatabase: scanGrouping?.auxiliaryDatabase || null,
+    heavyFolders: scanGrouping?.heavyFolders || [],
+    dependencyGroups: scanGrouping?.dependencyGroups || [],
+    dependencyGroupCount: scanGrouping?.dependencyGroups?.length || 0,
+    targetedDfsProbes: scanGrouping?.targetedDfs || {
+      scheduled: 0,
+      skipped: 0,
+      remainingBudget: 0,
+      parsed: 0,
+      partialReads: 0
+    },
+    depthBreakdown,
+    entries: directories + totalFiles,
     edges: edges.length,
     components: components.length,
     cycles: cycles.length,
     cycleNodes: fileNodes.filter((node) => node.inCycle).length,
     skipped: skipped.length,
     warnings: warnings.length,
+    stoppedEarly: Boolean(stopReason),
+    stopReason,
     byClassification,
     byRisk,
     byDeletionDecision,
@@ -1411,6 +2568,46 @@ function buildSummary(nodes, fileNodes, edges, components, cycles, skipped, warn
     highImpactProviders: fileNodes.filter((node) => node.impactCount >= 6 || node.incoming >= 4).length,
     totalTransitiveImpact: fileNodes.reduce((sum, node) => sum + node.impactCount, 0)
   };
+}
+
+function buildDepthBreakdown(fileNodes) {
+  const groups = new Map();
+
+  for (const node of fileNodes) {
+    const depth = Number.isFinite(Number(node.scanDepth)) ? Number(node.scanDepth) : filesystemDepth(node.relativePath);
+    if (!groups.has(depth)) {
+      groups.set(depth, {
+        depth,
+        files: 0,
+        bytes: 0,
+        human: "0 B",
+        canDelete: 0,
+        probablyUseless: 0,
+        blocked: 0,
+        risk: {
+          baixo: 0,
+          medio: 0,
+          alto: 0,
+          critico: 0
+        }
+      });
+    }
+
+    const group = groups.get(depth);
+    group.files += 1;
+    group.bytes += node.size || 0;
+    group.canDelete += node.deletionDecision === "pode_apagar" ? 1 : 0;
+    group.probablyUseless += node.utilityStatus === "inutil_provavel" || node.deletionDecision === "inutil_provavel" ? 1 : 0;
+    group.blocked += node.deletionDecision === "nao_apagar" ? 1 : 0;
+    group.risk[node.risk] = (group.risk[node.risk] || 0) + 1;
+  }
+
+  return Array.from(groups.values())
+    .sort((a, b) => a.depth - b.depth)
+    .map((group) => ({
+      ...group,
+      human: formatBytes(group.bytes)
+    }));
 }
 
 function buildSimulation(fileNodes) {
@@ -1554,6 +2751,20 @@ function buildGraphViews(nodes, fileNodes, edges) {
   };
 }
 
+function emptyGraphViews() {
+  const emptyView = {
+    mode: "compactacao_servidor",
+    description: "grafo omitido nesta etapa para reduzir memoria; a API progressiva reconstrói uma visao compacta",
+    nodes: [],
+    edges: []
+  };
+  return {
+    far: emptyView,
+    medium: emptyView,
+    close: emptyView
+  };
+}
+
 function buildDirectoryGraph(nodes, fileNodes, edges) {
   const directoryNodes = nodes.filter((node) => node.kind === "directory");
   const directoryCounts = countDirectoriesByTopLevel(directoryNodes);
@@ -1640,9 +2851,13 @@ function buildGroupedGraph(fileNodes, edges) {
     const extension = first.extension || "sem_ext";
     const groupReason = key.startsWith("shared:")
       ? "arquivos com dependencias em comum"
+      : key.startsWith("dpn:")
+        ? "arquivos agrupados por DPN, uso e categoria"
       : "arquivos agrupados por pasta, tipo e risco";
     const label = key.startsWith("shared:")
       ? `${files.length} arquivos dependentes`
+      : key.startsWith("dpn:")
+        ? `${files.length} ${first.fileKnowledge?.riskCategory || "dpn"} em ${topDirectory(first.relativePath)}`
       : `${files.length} ${extension} em ${topDirectory(first.relativePath)}`;
     const id = `medium:group:${groupIndex}`;
     for (const file of files) {
@@ -1760,6 +2975,10 @@ function mediumGroupKey(file, edgeTargetsBySource) {
     return `shared:${targets.slice(0, 5).join("|")}`;
   }
 
+  if (file.dependencyGroup) {
+    return `dpn:${topDirectory(file.relativePath)}:${file.dependencyGroup}:${file.risk}:${file.classification}`;
+  }
+
   return `kind:${topDirectory(file.relativePath)}:${file.extension || "sem_ext"}:${file.risk}:${file.classification}`;
 }
 
@@ -1858,6 +3077,8 @@ function stripInternalNodeFields(node) {
     outgoingTo,
     detectedDependencies,
     canReadContent,
+    initialUnresolvedDependencies,
+    initialUnresolvedSpecifiers,
     readError,
     ...publicNode
   } = node;
@@ -1876,6 +3097,26 @@ function normalizeRelative(value) {
 
 function normalizeKey(value) {
   return normalizeRelative(value).toLowerCase();
+}
+
+function filesystemDepth(relativePath) {
+  const normalized = normalizeRelative(relativePath);
+  if (!normalized || normalized === ".") {
+    return 0;
+  }
+  return normalized.split("/").filter(Boolean).length - 1;
+}
+
+function formatBytes(bytes) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Number(bytes) || 0;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const digits = value >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
 function isKnownPythonStdlib(moduleName) {
@@ -1920,7 +3161,9 @@ const PYTHON_STDLIB = new Set([
 
 module.exports = {
   analyzeDirectory,
+  analyzeDirectoryProgressive,
   escanear_diretorio: analyzeDirectory,
+  escanear_diretorio_progressivo: analyzeDirectoryProgressive,
   extractDependencies,
   detectar_dependencias: extractDependencies,
   resolveDependency,
@@ -1928,7 +3171,9 @@ module.exports = {
   construir_grafo: buildGraphViews,
   classificar_arquivo: classifyNode,
   simular_riscos: buildSimulation,
+  construir_passos_progressivos: buildProgressiveDepthSteps,
   DEFAULT_OPTIONS,
   MAX_SCAN_FILES,
-  MAX_SCAN_DEPTH
+  MAX_SCAN_DEPTH,
+  DEFAULT_PROGRESSIVE_FILE_BUDGET
 };

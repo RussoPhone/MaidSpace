@@ -37,8 +37,16 @@
             <b>Leitura adaptavel</b>
           </label>
           <label class="inline-check">
-            <input id="saveState" type="checkbox" checked>
+            <input id="saveState" type="checkbox">
             <b>Salvar estado A.L.C</b>
+          </label>
+          <label class="inline-check experimental-check">
+            <input id="progressiveScan" type="checkbox" checked>
+            <b>Varredura progressiva</b>
+          </label>
+          <label class="inline-check">
+            <input id="includeProgramFiles" type="checkbox">
+            <b>Incluir Program Files</b>
           </label>
           <div class="compact-grid">
             <label class="field">
@@ -73,6 +81,10 @@
               <span id="progressBar" class="progress-fill"></span>
             </div>
           </div>
+          <div id="systemLog" class="system-log" aria-live="polite">
+            <strong>Log do sistema</strong>
+            <ol id="systemLogList"></ol>
+          </div>
         </section>
 
         <section class="rail-section">
@@ -90,6 +102,12 @@
               <option value="alto">Alto</option>
               <option value="medio">Medio</option>
               <option value="baixo">Baixo</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Profundidade</span>
+            <select id="depthFilter" title="Filtrar profundidade lida">
+              <option value="all">Todas</option>
             </select>
           </label>
           <label class="field">
@@ -150,6 +168,16 @@
             </div>
           </div>
           <div id="continuousState" class="state-grid"></div>
+        </section>
+
+        <section class="data-dock" aria-label="Profundidades lidas">
+          <div class="dock-heading">
+            <div>
+              <h2>Profundidades</h2>
+              <p>Memoria acumulada da varredura e ganho espacial estimado pelo A.R.E.</p>
+            </div>
+          </div>
+          <div id="depthTimeline" class="depth-timeline"></div>
         </section>
 
         <section class="data-dock" aria-label="Dados da varredura">

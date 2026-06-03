@@ -58,7 +58,12 @@ const MODE_RULES = {
   }
 };
 
-function generateRelocationPlan(addReport) {
+function generateRelocationPlan(addReport, options = {}) {
+  const compact = options.compact === true;
+  const candidateLimit = compact ? clampInteger(options.candidateLimit, 20, 1000, 160) : Infinity;
+  const packageLimit = compact ? clampInteger(options.packageLimit, 20, 500, 80) : Infinity;
+  const blockedLimit = compact ? clampInteger(options.blockedLimit, 20, 2000, 240) : Infinity;
+  const operationLimit = compact ? clampInteger(options.operationLimit, 20, 2000, 240) : Infinity;
   const files = (addReport.nodes || []).filter((node) => node.kind === "file");
   const cycles = addReport.cycles || [];
   const context = {
@@ -66,18 +71,21 @@ function generateRelocationPlan(addReport) {
     componentMap: buildComponentMap(files)
   };
   const spatialEntries = files.map((node) => analyzeSpaceCandidate(node, context));
-  const operations = spatialEntries.map((entry) => planFile(entry.node, entry));
+  const operationStats = summarizeOperations(spatialEntries);
+  const operations = selectTopSpatialEntries(spatialEntries, operationLimit).map((entry) => planFile(entry.node, entry));
   const proposedStructure = buildProposedStructure(operations, cycles);
   const groups = groupOperations(operations);
-  const spaceModes = buildSpaceModes(spatialEntries, context.nodeByPath);
-  const blockedFiles = spatialEntries
-    .filter((entry) => entry.modes.length === 0)
-    .map(toBlockedFile)
-    .sort((a, b) => b.sizeBytes - a.sizeBytes || a.path.localeCompare(b.path));
+  const spaceModes = buildSpaceModes(spatialEntries, context.nodeByPath, { candidateLimit, packageLimit });
+  const blockedEntries = spatialEntries.filter((entry) => entry.modes.length === 0);
+  const blockedFiles = selectTopSpatialEntries(blockedEntries, blockedLimit)
+    .map(toBlockedFile);
   const safetyReport = buildSafetyReport(spaceModes, blockedFiles, cycles);
-  const totalBytes = files.reduce((sum, node) => sum + (node.size || 0), 0);
-  const blockedBytes = blockedFiles.reduce((sum, item) => sum + (item.sizeBytes || 0), 0);
+  const storedBytes = files.reduce((sum, node) => sum + (node.size || 0), 0);
+  const totalBytes = Number(addReport.summary?.totalBytes) || storedBytes;
+  const totalFiles = Number(addReport.summary?.files) || files.length;
+  const blockedBytes = blockedEntries.reduce((sum, item) => sum + (item.sizeBytes || 0), 0);
   const relocationSimulation = buildRelocationSimulation(spaceModes, totalBytes, blockedFiles);
+  const depthRelocation = buildDepthRelocationBreakdown(spatialEntries);
 
   return {
     schemaVersion: 4,
@@ -88,15 +96,21 @@ function generateRelocationPlan(addReport) {
     objective: "calcular quanto espaco pode ser realocado com seguranca usando o relatorio do A.D.D",
     question: "Quanto pode ser realocado?",
     summary: {
-      totalFiles: files.length,
+      totalFiles,
+      analyzedFiles: files.length,
+      storedFiles: files.length,
       totalBytes,
       totalHuman: formatBytes(totalBytes),
-      suggestions: operations.length,
-      keepInPlace: operations.filter((item) => item.action === "manter").length,
-      moveCandidates: operations.filter((item) => item.action === "sugerir_mover").length,
-      reviewCandidates: operations.filter((item) => item.action === "revisar").length,
-      safeTrashCandidates: operations.filter((item) => item.action === "sugerir_lixeira_segura").length,
-      blockedFiles: blockedFiles.length,
+      analyzedBytes: storedBytes,
+      analyzedHuman: formatBytes(storedBytes),
+      inventoryProvider: addReport.summary?.inventoryProvider || "node",
+      inventoryTruncated: Boolean(addReport.summary?.inventoryTruncated),
+      suggestions: operationStats.suggestions,
+      keepInPlace: operationStats.keepInPlace,
+      moveCandidates: operationStats.moveCandidates,
+      reviewCandidates: operationStats.reviewCandidates,
+      safeTrashCandidates: operationStats.safeTrashCandidates,
+      blockedFiles: blockedEntries.length,
       blockedBytes,
       blockedHuman: formatBytes(blockedBytes),
       reallocatable: {
@@ -109,9 +123,12 @@ function generateRelocationPlan(addReport) {
         medio: spaceModes.medio.reallocatableHuman,
         alto: spaceModes.alto.reallocatableHuman
       },
+      depthRelocation,
+      compactedLists: compact,
       cycleBlocks: cycles.length
     },
     relocationSimulation,
+    depthRelocation,
     spaceModes,
     candidatesByMode: {
       baixo: spaceModes.baixo.candidates,
@@ -141,6 +158,97 @@ function generateRelocationPlan(addReport) {
     ],
     note: "Simulacao espacial: bytes realocados representam o que sairia do diretorio principal se o usuario confirmasse a realocacao indicada."
   };
+}
+
+function buildDepthRelocationBreakdown(spatialEntries) {
+  const groups = new Map();
+
+  for (const entry of spatialEntries) {
+    const depth = Number.isFinite(Number(entry.node.scanDepth)) ? Number(entry.node.scanDepth) : filesystemDepth(entry.path);
+    if (!groups.has(depth)) {
+      groups.set(depth, {
+        depth,
+        files: 0,
+        totalBytes: 0,
+        totalHuman: "0 B",
+        blockedBytes: 0,
+        blockedHuman: "0 B",
+        reallocatable: {
+          baixo: 0,
+          medio: 0,
+          alto: 0
+        },
+        reallocatableHuman: {
+          baixo: "0 B",
+          medio: "0 B",
+          alto: "0 B"
+        }
+      });
+    }
+
+    const group = groups.get(depth);
+    const size = entry.sizeBytes || 0;
+    group.files += 1;
+    group.totalBytes += size;
+    if (!entry.modes.length) {
+      group.blockedBytes += size;
+    }
+    for (const mode of MODE_ORDER) {
+      if (entry.modes.includes(mode)) {
+        group.reallocatable[mode] += size;
+      }
+    }
+  }
+
+  return Array.from(groups.values())
+    .sort((a, b) => a.depth - b.depth)
+    .map((group) => ({
+      ...group,
+      totalHuman: formatBytes(group.totalBytes),
+      blockedHuman: formatBytes(group.blockedBytes),
+      reallocatableHuman: {
+        baixo: formatBytes(group.reallocatable.baixo),
+        medio: formatBytes(group.reallocatable.medio),
+        alto: formatBytes(group.reallocatable.alto)
+      }
+    }));
+}
+
+function summarizeOperations(spatialEntries) {
+  const summary = {
+    suggestions: spatialEntries.length,
+    keepInPlace: 0,
+    moveCandidates: 0,
+    reviewCandidates: 0,
+    safeTrashCandidates: 0
+  };
+
+  for (const entry of spatialEntries) {
+    if (!entry.modes.length) {
+      summary.keepInPlace += 1;
+    } else if (entry.node.deletionDecision === "pode_apagar") {
+      summary.safeTrashCandidates += 1;
+    } else if (entry.node.deletionDecision === "inutil_provavel") {
+      summary.reviewCandidates += 1;
+    } else {
+      summary.moveCandidates += 1;
+    }
+  }
+
+  return summary;
+}
+
+function selectTopSpatialEntries(entries, limit) {
+  const safeLimit = Number.isFinite(limit) ? limit : entries.length;
+  return entries
+    .slice()
+    .sort((a, b) => spatialEntryScore(b) - spatialEntryScore(a) || a.path.localeCompare(b.path))
+    .slice(0, safeLimit);
+}
+
+function spatialEntryScore(entry) {
+  const modeBonus = entry.modes.includes("alto") ? 400000 : entry.modes.includes("medio") ? 250000 : entry.modes.includes("baixo") ? 120000 : 0;
+  return (entry.packageBytes || entry.sizeBytes || 0) + modeBonus + ((entry.node.impactCount || 0) * 1000);
 }
 
 function analyzeSpaceCandidate(node, context) {
@@ -274,16 +382,17 @@ function packageBlockReasonsFor(packageNodes, mode) {
   return Array.from(new Set(reasons));
 }
 
-function buildSpaceModes(spatialEntries, nodeByPath) {
+function buildSpaceModes(spatialEntries, nodeByPath, options = {}) {
   const result = {};
 
   for (const mode of MODE_ORDER) {
     const entries = spatialEntries.filter((entry) => entry.modes.includes(mode));
-    const packages = buildModePackages(entries, nodeByPath, mode);
+    const packages = buildModePackages(entries, nodeByPath, mode, { limit: options.packageLimit });
     const candidates = entries
       .map((entry) => toModeCandidate(entry, mode))
-      .sort((a, b) => b.packageBytes - a.packageBytes || a.path.localeCompare(b.path));
-    const reallocatableBytes = packages.reduce((sum, item) => sum + item.bytes, 0);
+      .sort((a, b) => b.packageBytes - a.packageBytes || a.path.localeCompare(b.path))
+      .slice(0, Number.isFinite(options.candidateLimit) ? options.candidateLimit : undefined);
+    const reallocatableBytes = sumUniqueBytes(entries, nodeByPath, mode);
 
     result[mode] = {
       mode,
@@ -303,10 +412,17 @@ function buildSpaceModes(spatialEntries, nodeByPath) {
   return result;
 }
 
-function buildModePackages(entries, nodeByPath, mode) {
+function buildModePackages(entries, nodeByPath, mode, options = {}) {
   const packages = new Map();
+  const limit = Number.isFinite(options.limit) ? options.limit : Infinity;
+  const orderedEntries = entries
+    .slice()
+    .sort((a, b) => (b.packageBytesByMode?.[mode] || b.sizeBytes || 0) - (a.packageBytesByMode?.[mode] || a.sizeBytes || 0));
 
-  for (const entry of entries) {
+  for (const entry of orderedEntries) {
+    if (packages.size >= limit) {
+      break;
+    }
     const packagePaths = (entry.packagePathsByMode?.[mode] || [entry.path]).slice().sort();
     const key = packagePaths.join("|");
     if (!packages.has(key)) {
@@ -720,6 +836,22 @@ function targetByType(node) {
 function directoryOf(relativePath) {
   const directory = path.posix.dirname(String(relativePath || ".").replace(/\\/g, "/"));
   return directory === "." ? "/" : `/${directory}`;
+}
+
+function filesystemDepth(relativePath) {
+  const normalized = String(relativePath || ".").replace(/\\/g, "/");
+  if (!normalized || normalized === ".") {
+    return 0;
+  }
+  return normalized.split("/").filter(Boolean).length - 1;
+}
+
+function clampInteger(value, min, max, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  if (Number.isNaN(parsed)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, parsed));
 }
 
 function minAge(nodes, dateField, fallbackAgeField = null) {
