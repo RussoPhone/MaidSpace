@@ -4,6 +4,7 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { analyzeDirectory } = require("../src/add/analyzer");
+const { generateRelocationPlan } = require("../src/are/planner");
 const { runSrcPipeline, runSrcPipelineProgressive } = require("../server");
 
 test("A.D.D classifica dicente, docente, isolado e protegido", async () => {
@@ -93,7 +94,7 @@ test("A.D.D detecta ciclo por DFS e marca bloco interdependente", async () => {
   assert.ok(byPath.get("a.js").simulation.moveRequires.includes("b.js"));
 });
 
-test("S.R.C gera plano A.R.E e estado A.L.C sem mover arquivos", async () => {
+test("MaidSpace gera plano A.R.E e estado A.L.C sem mover arquivos", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-pipeline-"));
   await fs.mkdir(path.join(root, "src"), { recursive: true });
   await fs.writeFile(path.join(root, "src", "main.js"), "import './dep.js';\n");
@@ -107,10 +108,11 @@ test("S.R.C gera plano A.R.E e estado A.L.C sem mover arquivos", async () => {
     dependencyMode: "full",
     maxFiles: 100,
     maxDepth: 4,
+    targetFreeBytes: 4096,
     saveState: false
   });
 
-  assert.equal(result.system, "S.R.C");
+  assert.equal(result.system, "MaidSpace");
   assert.equal(result.modules.add.status, "concluido");
   assert.equal(result.modules.are.status, "plano_gerado");
   assert.equal(result.modules.alc.status, "estado_nao_salvo");
@@ -136,6 +138,7 @@ test("A.R.E calcula espaco realocavel por modo e arquivos bloqueados", async () 
     dependencyMode: "full",
     maxFiles: 100,
     maxDepth: 4,
+    targetFreeBytes: 4096,
     saveState: false
   });
   const plan = result.relocationPlan;
@@ -152,7 +155,11 @@ test("A.R.E calcula espaco realocavel por modo e arquivos bloqueados", async () 
     plan.summary.totalBytes - plan.relocationSimulation.medio.relocatedBytes
   );
   assert.ok(plan.relocationSimulation.medio.simulatedMoves.some((item) => item.files.includes("src/dep.js")));
-  assert.ok(plan.blockedFiles.some((item) => item.path === "recent.txt"));
+  assert.equal(plan.candidatesByMode.baixo.some((item) => item.path === "recent.txt"), false);
+  assert.equal(plan.candidatesByMode.medio.some((item) => item.path === "recent.txt"), false);
+  assert.ok(plan.candidatesByMode.alto.some((item) => item.path === "recent.txt"));
+  assert.equal(plan.targetPlan.selectedMode, "baixo");
+  assert.equal(plan.targetPlan.status, "atingivel");
   assert.match(plan.safetyReport.text, /Modo baixo/);
 });
 
@@ -195,6 +202,7 @@ test("A.D.D permite alternar leitura de Program Files", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-program-files-"));
   await fs.mkdir(path.join(root, "Program Files", "Tool", "downloads"), { recursive: true });
   await fs.writeFile(path.join(root, "Program Files", "Tool", "downloads", "cache.tmp"), "cache antigo\n");
+  await fs.writeFile(path.join(root, "Program Files", "Tool", "tool.dll"), Buffer.alloc(1024));
 
   const blocked = await analyzeDirectory(root, {
     scanEngine: "node",
@@ -215,6 +223,153 @@ test("A.D.D permite alternar leitura de Program Files", async () => {
 
   assert.equal(blocked.nodes.some((node) => node.relativePath === "Program Files/Tool/downloads/cache.tmp"), false);
   assert.equal(allowed.nodes.some((node) => node.relativePath === "Program Files/Tool/downloads/cache.tmp"), true);
+  assert.equal(allowed.nodes.find((node) => node.relativePath === "Program Files/Tool/tool.dll").classification, "isolado");
+  assert.equal(allowed.nodes.find((node) => node.relativePath === "Program Files/Tool/tool.dll").fileKnowledge.isInstalledApplication, true);
+});
+
+test("A.D.D registra areas grandes por padrao sem isentar a pasta inteira", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-full-storage-"));
+  await fs.mkdir(path.join(root, "Program Files (x86)", "Steam", "steamapps"), { recursive: true });
+  await fs.mkdir(path.join(root, "Users", "me", "AppData", "Local", "Temp"), { recursive: true });
+  await fs.writeFile(path.join(root, "Program Files (x86)", "Steam", "steamapps", "game.bin"), Buffer.alloc(4096));
+  await fs.writeFile(path.join(root, "Users", "me", "AppData", "Local", "Temp", "cache.tmp"), Buffer.alloc(2048));
+
+  const result = await analyzeDirectory(root, {
+    scanEngine: "node",
+    dependencyMode: "metadata",
+    adaptive: false,
+    maxFiles: 100,
+    maxDepth: 8
+  });
+  const byPath = new Map(result.nodes.map((node) => [node.relativePath, node]));
+
+  assert.equal(result.options.includeProgramFiles, true);
+  assert.equal(byPath.has("Program Files (x86)/Steam/steamapps/game.bin"), true);
+  assert.equal(byPath.has("Users/me/AppData/Local/Temp/cache.tmp"), true);
+  assert.notEqual(byPath.get("Program Files (x86)/Steam/steamapps/game.bin").classification, "critico_protegido");
+});
+
+test("A.D.D padrao pula apenas diretorios obvios do sistema e mantem areas limpaveis", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "src-system-skip-"));
+  await fs.mkdir(path.join(root, "Windows", "System32"), { recursive: true });
+  await fs.mkdir(path.join(root, "ProgramData", "Vendor", "Cache"), { recursive: true });
+  await fs.mkdir(path.join(root, "$Recycle.Bin", "S-1-5-21"), { recursive: true });
+  await fs.writeFile(path.join(root, "Windows", "System32", "kernel32.dll"), Buffer.alloc(1024));
+  await fs.writeFile(path.join(root, "ProgramData", "Vendor", "Cache", "blob.tmp"), Buffer.alloc(2048));
+  await fs.writeFile(path.join(root, "$Recycle.Bin", "S-1-5-21", "deleted.iso"), Buffer.alloc(4096));
+
+  const result = await analyzeDirectory(root, {
+    scanEngine: "node",
+    dependencyMode: "metadata",
+    adaptive: false,
+    maxFiles: 100,
+    maxDepth: 8
+  });
+  const byPath = new Map(result.nodes.map((node) => [node.relativePath, node]));
+
+  assert.equal(byPath.has("Windows/System32/kernel32.dll"), false);
+  assert.equal(byPath.has("ProgramData/Vendor/Cache/blob.tmp"), true);
+  assert.equal(byPath.has("$Recycle.Bin/S-1-5-21/deleted.iso"), true);
+  assert.ok(result.skipped.some((item) => item.path === "Windows/System32"));
+  assert.equal(byPath.get("ProgramData/Vendor/Cache/blob.tmp").classification, "isolado");
+});
+
+test("A.R.E alto apresenta potencial de 100GB fora de sistema sem desbloquear System32", () => {
+  const hundredGb = 100 * 1024 * 1024 * 1024;
+  const now = new Date().toISOString();
+  const addReport = {
+    rootPath: "C:/",
+    summary: {
+      files: 2,
+      totalBytes: hundredGb + 4096,
+      inventoryProvider: "robocopy",
+      inventoryTruncated: false
+    },
+    nodes: [
+      {
+        id: "file:Users/me/Videos/capture.raw",
+        kind: "file",
+        name: "capture.raw",
+        relativePath: "Users/me/Videos/capture.raw",
+        extension: ".raw",
+        size: hundredGb,
+        modifiedAt: now,
+        lastAccessedAt: now,
+        daysSinceAccess: 0,
+        classification: "isolado",
+        risk: "medio",
+        deletionDecision: "averiguar",
+        relocationDecision: "averiguar",
+        protectedReasons: [],
+        fileKnowledge: { isUserContent: true, isLowValueGenerated: false },
+        impact: { system: "nao_afeta_sistema", user: "medio", dependencies: "nenhum" },
+        incoming: 0,
+        outgoing: 0,
+        impactCount: 0,
+        componentId: "file:Users/me/Videos/capture.raw",
+        inCycle: false
+      },
+      {
+        id: "file:Windows/System32/kernel32.dll",
+        kind: "file",
+        name: "kernel32.dll",
+        relativePath: "Windows/System32/kernel32.dll",
+        extension: ".dll",
+        size: 4096,
+        modifiedAt: now,
+        lastAccessedAt: now,
+        daysSinceAccess: 0,
+        classification: "critico_protegido",
+        risk: "critico",
+        deletionDecision: "nao_apagar",
+        relocationDecision: "nao_mover",
+        protectedReasons: ["diretorio critico do sistema operacional"],
+        fileKnowledge: { isSystemEssential: true },
+        impact: { system: "afeta_sistema", user: "alto", dependencies: "critico" },
+        incoming: 0,
+        outgoing: 0,
+        impactCount: 0,
+        componentId: "file:Windows/System32/kernel32.dll",
+        inCycle: false
+      }
+    ],
+    cycles: []
+  };
+
+  const plan = generateRelocationPlan(addReport);
+
+  assert.equal(plan.spaceModes.alto.reallocatableBytes, hundredGb);
+  assert.equal(plan.spaceModes.alto.reallocatableHuman, "100 GB");
+  assert.ok(plan.candidatesByMode.alto.some((item) => item.path === "Users/me/Videos/capture.raw"));
+  assert.ok(plan.blockedFiles.some((item) => item.path === "Windows/System32/kernel32.dll"));
+});
+
+test("A.R.E usa estimativa completa do inventario quando detalhes sao compactados", () => {
+  const hundredGb = 100 * 1024 * 1024 * 1024;
+  const addReport = {
+    rootPath: "C:/",
+    summary: {
+      files: 500000,
+      totalBytes: 512 * 1024 * 1024 * 1024,
+      inventoryProvider: "robocopy",
+      inventoryTruncated: true,
+      inventoryReclaimable: {
+        provider: "metadata_estimate",
+        baixo: { files: 10, bytes: 4 * 1024 * 1024 * 1024 },
+        medio: { files: 25, bytes: 20 * 1024 * 1024 * 1024 },
+        alto: { files: 120, bytes: hundredGb }
+      }
+    },
+    nodes: [],
+    cycles: []
+  };
+
+  const plan = generateRelocationPlan(addReport);
+
+  assert.equal(plan.spaceModes.alto.reallocatableBytes, hundredGb);
+  assert.equal(plan.spaceModes.alto.inventoryEstimateUsed, true);
+  assert.equal(plan.spaceModes.alto.fileCount, 0);
+  assert.equal(plan.summary.inventoryEstimatedReclaimableHuman.alto, "100 GB");
 });
 
 test("A.D.D agrupa DPN em HF e usa DFS limitado apenas em alvo de risco", async () => {

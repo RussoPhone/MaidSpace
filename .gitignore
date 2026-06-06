@@ -1,0 +1,17 @@
+node_modules/
+
+# Rust/Tauri build outputs
+target/
+src-core/add-core/target/
+src-tauri/target/
+src-tauri/gen/
+
+# Local runtime state and logs
+data/states/
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

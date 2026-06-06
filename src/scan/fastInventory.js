@@ -43,6 +43,11 @@ const PROTECTED_EXTENSIONS = new Set([
   ".sys"
 ]);
 
+const SYSTEM_PROTECTED_EXTENSIONS = new Set([
+  ".reg",
+  ".sys"
+]);
+
 const TEXT_EXTENSIONS = new Set([
   ".astro",
   ".c",
@@ -90,6 +95,9 @@ const SPECIAL_TEXT_FILES = new Set([
 ]);
 
 const DEFAULT_HEAVY_FOLDER_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_FAST_DETAIL_FILES = 120000;
+const DEFAULT_FAST_DETAIL_DIRECTORIES = 120000;
+const CLEANUP_MODE_ORDER = ["baixo", "medio", "alto"];
 
 async function scanFastInventory(rootPath, options = {}, onProgress = null) {
   if (process.platform === "win32") {
@@ -113,14 +121,18 @@ async function scanWithRobocopy(rootPath, options = {}, onProgress = null) {
   await fs.mkdir(destination, { recursive: true });
 
   const maxMs = clampNumber(options.fastScanMs, 1000, 10 * 60 * 1000, 30000);
-  const maxStoredFiles = clampNumber(options.fastStoredFiles, 1000, 500000, 25000);
-  const maxStoredDirectories = clampNumber(options.fastStoredDirectories, 500, 100000, 20000);
+  const maxStoredFiles = clampNumber(options.fastStoredFiles, 1000, Infinity, DEFAULT_FAST_DETAIL_FILES);
+  const maxStoredDirectories = clampNumber(options.fastStoredDirectories, 500, Infinity, DEFAULT_FAST_DETAIL_DIRECTORIES);
+  const overflowPruneThreshold = Number.isFinite(maxStoredFiles)
+    ? Math.max(2500, Math.min(50000, Math.floor(maxStoredFiles * 0.25)))
+    : Infinity;
   const stats = emptyStats("robocopy");
   const nodes = [];
   const fileNodes = [];
   const skipped = [];
   const warnings = [];
   const overflow = [];
+  const inventoryReclaimable = createInventoryReclaimable();
   const folderDatabase = new Map();
   const dependencyGroupDatabase = new Map();
   const startedAt = Date.now();
@@ -232,6 +244,7 @@ async function scanWithRobocopy(rootPath, options = {}, onProgress = null) {
   stats.heavyFolders = auxiliaryInventory.heavyFolders;
   stats.dependencyGroups = auxiliaryInventory.dependencyGroups;
   stats.auxiliaryDatabase = auxiliaryInventory.auxiliaryDatabase;
+  stats.inventoryReclaimable = finalizeInventoryReclaimable(inventoryReclaimable);
   if (stopReason) {
     warnings.push(stopReason);
   }
@@ -270,6 +283,7 @@ async function scanWithRobocopy(rootPath, options = {}, onProgress = null) {
       stats.files += 1;
       stats.totalBytes += node.size || 0;
       lastPath = relativePath;
+      rememberInventoryReclaimable(node);
       rememberAuxiliaryFile(node);
       rememberFileNode(node);
       emitProgress();
@@ -357,7 +371,7 @@ async function scanWithRobocopy(rootPath, options = {}, onProgress = null) {
       return;
     }
     overflow.push(node);
-    if (overflow.length >= 2500) {
+    if (overflow.length >= overflowPruneThreshold) {
       pruneStoredFiles(false);
     }
   }
@@ -366,8 +380,14 @@ async function scanWithRobocopy(rootPath, options = {}, onProgress = null) {
     if (!overflow.length && !finalPass) {
       return;
     }
+    if (!overflow.length) {
+      return;
+    }
     if (overflow.length) {
       fileNodes.push(...overflow.splice(0));
+    }
+    if (!Number.isFinite(maxStoredFiles)) {
+      return;
     }
     const selectedFiles = selectBalancedInventoryNodes(fileNodes, maxStoredFiles);
     fileNodes.length = 0;
@@ -394,8 +414,13 @@ async function scanWithRobocopy(rootPath, options = {}, onProgress = null) {
       elapsedMs: now - startedAt,
       storedFiles: fileNodes.length,
       dependencyGroups: dependencyGroupDatabase.size,
-      heavyFolderCandidates: Array.from(folderDatabase.values()).filter((folder) => isHeavyFolder(folder, options)).length
+      heavyFolderCandidates: Array.from(folderDatabase.values()).filter((folder) => isHeavyFolder(folder, options)).length,
+      inventoryReclaimable: finalizeInventoryReclaimable(inventoryReclaimable)
     });
+  }
+
+  function rememberInventoryReclaimable(node) {
+    updateInventoryReclaimable(inventoryReclaimable, node);
   }
 }
 
@@ -538,26 +563,36 @@ function protectedReasonsFor(absolutePath, relativePath, name, extension, option
   if (PROTECTED_FILE_NAMES.has(lowerName)) {
     reasons.push("arquivo de configuracao/lock");
   }
-  if (PROTECTED_EXTENSIONS.has(lowerExtension)) {
-    reasons.push("executavel ou biblioteca do sistema");
+  if (SYSTEM_PROTECTED_EXTENSIONS.has(lowerExtension)) {
+    reasons.push("arquivo essencial do sistema");
+  } else if (PROTECTED_EXTENSIONS.has(lowerExtension) && isStrictSystemPath(lowerAbsolute, lowerRelative)) {
+    reasons.push("binario em diretorio critico do sistema");
   }
   if (knowledge.isSystemEssential) {
     reasons.push("tipo essencial do sistema");
   }
-  if (knowledge.isProjectDependency) {
+  if (knowledge.isProjectDependency && PROTECTED_FILE_NAMES.has(lowerName)) {
     reasons.push("dependencia/configuracao de projeto");
   }
-  if (/(^|[\\/])(windows|system32|winsxs|windowsapps|programdata|recovery|system volume information|\$recycle\.bin)([\\/]|$)/i.test(lowerAbsolute)) {
-    reasons.push("diretorio do sistema operacional");
-  }
-  if (/(^|\/)(windows|system32|winsxs|windowsapps|programdata|recovery|system volume information|\$recycle\.bin)(\/|$)/i.test(lowerRelative)) {
-    reasons.push("diretorio do sistema operacional");
+  if (isStrictSystemPath(lowerAbsolute, lowerRelative)) {
+    reasons.push("diretorio critico do sistema operacional");
   }
   if (!options.includeProgramFiles && /(^|[\\/])program files( \(x86\))?([\\/]|$)/i.test(lowerAbsolute)) {
     reasons.push("diretorio do sistema operacional");
   }
 
   return Array.from(new Set(reasons));
+}
+
+function isStrictSystemPath(absolutePath, relativePath = "") {
+  const corpus = [
+    String(absolutePath || "").replace(/\\/g, "/").toLowerCase(),
+    normalizeRelative(relativePath).toLowerCase()
+  ].join("\n");
+
+  return /(^|\/)(system32|syswow64|winsxs|windowsapps|recovery|system volume information|\$winreagent)(\/|$)/i.test(corpus)
+    || /(^|\/)windows\/(system32|syswow64|winsxs|servicing|systemresources|security|inf|assembly|diagnostics)(\/|$)/i.test(corpus)
+    || /(^|\/)programdata\/microsoft(\/|$)/i.test(corpus);
 }
 
 function inventoryNodeScore(node) {
@@ -585,7 +620,89 @@ function inventoryNodeScore(node) {
   return score;
 }
 
+function createInventoryReclaimable() {
+  const blank = () => ({ files: 0, bytes: 0, human: "0 B" });
+  return {
+    provider: "metadata_estimate",
+    baixo: blank(),
+    medio: blank(),
+    alto: blank(),
+    blocked: blank()
+  };
+}
+
+function updateInventoryReclaimable(reclaimable, node) {
+  const mode = metadataCleanupMode(node);
+  if (!mode) {
+    reclaimable.blocked.files += 1;
+    reclaimable.blocked.bytes += node.size || 0;
+    return;
+  }
+
+  const start = CLEANUP_MODE_ORDER.indexOf(mode);
+  for (let index = start; index < CLEANUP_MODE_ORDER.length; index += 1) {
+    const bucket = reclaimable[CLEANUP_MODE_ORDER[index]];
+    bucket.files += 1;
+    bucket.bytes += node.size || 0;
+  }
+}
+
+function metadataCleanupMode(node) {
+  if (node.protectedReasons?.length || node.fileKnowledge?.isSystemEssential) {
+    return null;
+  }
+
+  const relativePath = String(node.relativePath || "").replace(/\\/g, "/").toLowerCase();
+  const extension = String(node.extension || "").toLowerCase();
+  const name = String(node.name || "").toLowerCase();
+  const size = node.size || 0;
+  const age = Number(node.daysSinceAccess ?? 0);
+  const knowledge = node.fileKnowledge || {};
+  const generatedPath = /(^|\/)(cache|caches|tmp|temp|logs?|\.cache|crashdumps|dumps|shadercache|webcache)(\/|$)/.test(relativePath);
+  const generatedFile = knowledge.isLowValueGenerated || /\.(tmp|temp|log|bak|old|dmp|chk|crdownload|part)$/i.test(name);
+  const archiveOrInstaller = knowledge.isArchive
+    || [".zip", ".7z", ".rar", ".iso", ".msi", ".exe"].includes(extension)
+    || /\b(setup|installer|install|driver)\b/.test(name);
+  const mediaOrUserPayload = knowledge.isUserContent
+    || [".mp4", ".mov", ".mkv", ".avi", ".wav", ".flac", ".mp3", ".psd", ".ai", ".raw"].includes(extension);
+  const appPayload = knowledge.isInstalledApplication
+    && (/(^|\/)(steamapps|common|downloads|cache|shadercache|epic games|games|mods)(\/|$)/.test(relativePath) || size >= 256 * 1024 * 1024);
+
+  if ((generatedPath || generatedFile) && age >= 7) {
+    return "baixo";
+  }
+  if (generatedPath || generatedFile) {
+    return "medio";
+  }
+  if ((archiveOrInstaller || /(^|\/)(downloads|download|backup|backups|archive|archives)(\/|$)/.test(relativePath)) && age >= 21) {
+    return "medio";
+  }
+  if (appPayload || archiveOrInstaller || mediaOrUserPayload || size >= 1024 * 1024 * 1024) {
+    return "alto";
+  }
+
+  return null;
+}
+
+function finalizeInventoryReclaimable(reclaimable) {
+  const finalized = {
+    provider: reclaimable.provider || "metadata_estimate"
+  };
+  for (const key of [...CLEANUP_MODE_ORDER, "blocked"]) {
+    const bucket = reclaimable[key] || { files: 0, bytes: 0 };
+    finalized[key] = {
+      files: bucket.files || 0,
+      bytes: bucket.bytes || 0,
+      human: formatBytes(bucket.bytes || 0)
+    };
+  }
+  return finalized;
+}
+
 function selectBalancedInventoryNodes(candidates, limit) {
+  if (!Number.isFinite(limit)) {
+    return candidates;
+  }
   if (candidates.length <= limit) {
     return candidates
       .slice()
@@ -848,7 +965,8 @@ function emptyStats(provider) {
     elapsedMs: 0,
     dependencyGroups: [],
     heavyFolders: [],
-    auxiliaryDatabase: null
+    auxiliaryDatabase: null,
+    inventoryReclaimable: finalizeInventoryReclaimable(createInventoryReclaimable())
   };
 }
 

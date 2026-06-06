@@ -4,7 +4,7 @@ const { startServer } = require("../../server");
 async function main() {
   const { url } = await startServer({ port: 0, host: "127.0.0.1" });
   openLocalWindow(url);
-  console.log("Janela local aberta. Feche este terminal para encerrar o S.R.C A.D.D.");
+  console.log("MaidSpace fallback aberto. Feche este terminal para encerrar o servidor local.");
 }
 
 function openLocalWindow(url) {

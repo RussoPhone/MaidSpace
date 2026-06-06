@@ -89,6 +89,31 @@ const DOCUMENT_EXTENSIONS = new Set([
   ".xlsx"
 ]);
 
+const BROAD_APPLICATION_PATHS = [
+  "program files/",
+  "program files (x86)/"
+];
+
+const STRICT_SYSTEM_PATH_FRAGMENTS = [
+  "programdata/microsoft/",
+  "system volume information/",
+  "windowsapps/",
+  "$winreagent/",
+  "system32/",
+  "syswow64/",
+  "winsxs/",
+  "recovery/",
+  "windows/assembly/",
+  "windows/diagnostics/",
+  "windows/inf/",
+  "windows/security/",
+  "windows/servicing/",
+  "windows/system32/",
+  "windows/systemresources/",
+  "windows/syswow64/",
+  "windows/winsxs/"
+];
+
 function classifyFileKnowledge(relativePath, fileName, extension, metadata = {}) {
   const knowledge = loadFileKnowledge();
   const normalizedPath = normalizePath(relativePath);
@@ -101,9 +126,12 @@ function classifyFileKnowledge(relativePath, fileName, extension, metadata = {})
     if (!bucket || typeof bucket !== "object") {
       continue;
     }
-    if (matchesBucket(bucket, normalizedPath, normalizedName, normalizedExtension)) {
+    if (matchesBucket(key, bucket, normalizedPath, normalizedName, normalizedExtension)) {
       categories.push(key);
     }
+  }
+  if (isBroadApplicationPath(normalizedPath)) {
+    categories.push("installedApplication");
   }
 
   const typeCategory = typeCategoryFor(normalizedName, normalizedExtension);
@@ -127,6 +155,7 @@ function classifyFileKnowledge(relativePath, fileName, extension, metadata = {})
     isProjectDependency: categories.includes("projectDependency"),
     isUserContent: categories.includes("userContent"),
     isLowValueGenerated: categories.includes("lowValueGenerated"),
+    isInstalledApplication: categories.includes("installedApplication"),
     isArchive: typeCategory === "arquivo_compactado",
     isExecutable: typeCategory === "executavel",
     isSourceCode: typeCategory === "codigo_fonte",
@@ -164,8 +193,11 @@ function typeCategoryFor(normalizedName, normalizedExtension) {
 }
 
 function riskCategoryFor(categories, typeCategory) {
-  if (categories.includes("systemEssential") || typeCategory === "executavel") {
+  if (categories.includes("systemEssential")) {
     return "sistema";
+  }
+  if (categories.includes("installedApplication") || typeCategory === "executavel") {
+    return "aplicativo_instalado";
   }
   if (categories.includes("projectDependency") || typeCategory === "codigo_fonte") {
     return "dependencia";
@@ -227,10 +259,27 @@ function sizeBucketFor(size) {
   return "1gb_plus";
 }
 
-function matchesBucket(bucket, normalizedPath, normalizedName, normalizedExtension) {
-  return includes(bucket.names, normalizedName)
-    || includes(bucket.extensions, normalizedExtension)
-    || (bucket.pathFragments || []).some((fragment) => normalizedPath.includes(normalizePath(fragment)));
+function matchesBucket(key, bucket, normalizedPath, normalizedName, normalizedExtension) {
+  const nameMatch = includes(bucket.names, normalizedName);
+  const extensionMatch = includes(bucket.extensions, normalizedExtension);
+  const pathMatch = (bucket.pathFragments || []).some((fragment) => normalizedPath.includes(normalizePath(fragment)));
+
+  if (key === "systemEssential") {
+    const strictSystemPath = isStrictSystemPath(normalizedPath);
+    const broadApplicationPathOnly = !strictSystemPath
+      && BROAD_APPLICATION_PATHS.some((fragment) => normalizedPath.includes(fragment));
+    return nameMatch
+      || (extensionMatch && strictSystemPath)
+      || (pathMatch && !broadApplicationPathOnly);
+  }
+
+  if (key === "projectDependency") {
+    return nameMatch
+      || pathMatch
+      || (extensionMatch && looksProjectLike(normalizedPath));
+  }
+
+  return nameMatch || extensionMatch || pathMatch;
 }
 
 function includes(items, value) {
@@ -239,6 +288,18 @@ function includes(items, value) {
 
 function normalizePath(value) {
   return String(value || "").replace(/\\/g, "/").toLowerCase();
+}
+
+function isStrictSystemPath(normalizedPath) {
+  return STRICT_SYSTEM_PATH_FRAGMENTS.some((fragment) => normalizedPath.includes(fragment));
+}
+
+function isBroadApplicationPath(normalizedPath) {
+  return BROAD_APPLICATION_PATHS.some((fragment) => normalizedPath.includes(fragment));
+}
+
+function looksProjectLike(normalizedPath) {
+  return /(^|\/)(\.git|\.hg|\.svn|node_modules|vendor|\.venv|venv|target|obj|bin|src|source)(\/|$)/.test(normalizedPath);
 }
 
 function fallbackKnowledge() {

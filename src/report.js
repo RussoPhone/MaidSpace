@@ -1,7 +1,7 @@
 function generateSrcReport({ addReport, relocationPlan, continuousState }) {
   const summary = addReport.summary || {};
   const lines = [
-    "# S.R.C - Relatorio de Analise",
+    "# MaidSpace - Relatorio de Analise",
     "",
     `Diretorio: ${addReport.rootPath}`,
     `Gerado em: ${summary.scannedAt || new Date().toISOString()}`,
@@ -42,8 +42,8 @@ function generateSrcReport({ addReport, relocationPlan, continuousState }) {
     `- Reanalise necessaria: ${continuousState.summary?.reanalysisNeeded ? "sim" : "nao"}`,
     "",
     "## Regras de seguranca",
-    "- O S.R.C nao apaga arquivos automaticamente.",
-    "- O S.R.C nao move arquivos automaticamente.",
+    "- O MaidSpace nao apaga arquivos automaticamente.",
+    "- O MaidSpace nao move arquivos automaticamente.",
     "- Ciclos sao tratados como blocos interdependentes.",
     "- Dependencias externas ao diretorio analisado sao ignoradas no grafo local.",
     "- Quando a seguranca nao e provada, a decisao cai para revisao."

@@ -49,25 +49,38 @@ const SPECIAL_TEXT_FILES = new Set([
   "build.gradle"
 ]);
 
-const MAX_SCAN_FILES = Infinity;
-const MAX_SCAN_DEPTH = Infinity;
+const MAX_SCAN_FILES = 50_000_000;
+const MAX_SCAN_DEPTH = 1024;
+const DEFAULT_FAST_DETAIL_FILES = 120_000;
+const DEFAULT_FAST_DETAIL_DIRECTORIES = 120_000;
 const DEFAULT_PROGRESSIVE_FILE_BUDGET = MAX_SCAN_FILES;
 const DEFAULT_HEAVY_FOLDER_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_SYSTEM_SKIP_DIRECTORIES = [
+  "$WinREAgent",
+  "$WINDOWS.~BT",
+  "$WINDOWS.~WS",
+  "Recovery",
+  "System Volume Information",
+  "System32",
+  "SysWOW64",
+  "WindowsApps",
+  "WinSxS"
+];
 
 const DEFAULT_OPTIONS = {
   adaptive: true,
   scanEngine: "turbo",
   dependencyMode: "metadata",
-  fastScanMs: 20000,
-  fastStoredFiles: 25000,
-  fastStoredDirectories: 20000,
+  fastScanMs: 10 * 60 * 1000,
+  fastStoredFiles: DEFAULT_FAST_DETAIL_FILES,
+  fastStoredDirectories: DEFAULT_FAST_DETAIL_DIRECTORIES,
   maxFiles: MAX_SCAN_FILES,
   maxDepth: MAX_SCAN_DEPTH,
   maxFileSizeBytes: 512 * 1024,
   unusedDaysThreshold: loadFileKnowledge().recentUse?.unusedWindowDays || 30,
   frequentUseDaysThreshold: loadFileKnowledge().recentUse?.frequentWindowDays || 7,
   includeHidden: true,
-  includeProgramFiles: false,
+  includeProgramFiles: true,
   sortEntries: false,
   greedyScan: true,
   skipReparsePoints: true,
@@ -80,43 +93,7 @@ const DEFAULT_OPTIONS = {
   heavyFolderFileThreshold: 2500,
   heavyFolderBytesThreshold: DEFAULT_HEAVY_FOLDER_BYTES,
   heavyFolderRiskThreshold: 8,
-  skipDirectories: [
-    "$Recycle.Bin",
-    ".git",
-    ".hg",
-    ".next",
-    ".nuxt",
-    ".svn",
-    ".turbo",
-    ".vite",
-    ".vscode",
-    ".gradle",
-    ".pub-cache",
-    ".dartServer",
-    "AppData",
-    "bower_components",
-    "build",
-    "cache",
-    "caches",
-    "coverage",
-    "dart-sdk",
-    "dist",
-    "docs",
-    "flutter",
-    "gradle",
-    "node_modules",
-    "out",
-    "target",
-    "Program Files",
-    "Program Files (x86)",
-    "ProgramData",
-    "Recovery",
-    "System32",
-    "System Volume Information",
-    "Windows",
-    "WindowsApps",
-    "WinSxS"
-  ]
+  skipDirectories: DEFAULT_SYSTEM_SKIP_DIRECTORIES
 };
 
 const PROTECTED_FILE_NAMES = new Set([
@@ -155,6 +132,11 @@ const PROTECTED_EXTENSIONS = new Set([
   ".reg",
   ".sh",
   ".so",
+  ".sys"
+]);
+
+const SYSTEM_PROTECTED_EXTENSIONS = new Set([
+  ".reg",
   ".sys"
 ]);
 
@@ -569,6 +551,7 @@ async function buildAddReportFromCollectedNodes({
   const cycles = detectCyclesDfs(fileNodes, edges);
   applyCycleMetadata(fileNodes, cycles);
   const components = buildComponents(fileNodes, edges);
+  const fileNodeById = new Map(fileNodes.map((node) => [node.id, node]));
   const depthById = computeDepths(fileNodes);
   applyComponentMetadata(fileNodes, components);
   applyImpactMetadata(fileNodes);
@@ -580,7 +563,7 @@ async function buildAddReportFromCollectedNodes({
   applySimulationMetadata(fileNodes);
 
   for (const component of components) {
-    const componentNodes = component.nodeIds.map((id) => fileNodes.find((node) => node.id === id)).filter(Boolean);
+    const componentNodes = component.nodeIds.map((id) => fileNodeById.get(id)).filter(Boolean);
     component.depth = Math.max(0, ...componentNodes.map((node) => node.depth));
     component.criticalRiskNodes = componentNodes.filter((node) => node.risk === "critico").length;
     component.highRiskNodes = componentNodes.filter((node) => node.risk === "alto").length;
@@ -1423,8 +1406,8 @@ function normalizeOptions(rawOptions, scaleEstimate = { scale: "medio" }) {
   );
   options.heavyFolderRiskThreshold = clampInteger(options.heavyFolderRiskThreshold, 0, 100000, DEFAULT_OPTIONS.heavyFolderRiskThreshold);
   options.fastScanMs = clampInteger(options.fastScanMs, 1000, 10 * 60 * 1000, DEFAULT_OPTIONS.fastScanMs);
-  options.fastStoredFiles = clampInteger(options.fastStoredFiles, 1000, 500000, DEFAULT_OPTIONS.fastStoredFiles);
-  options.fastStoredDirectories = clampInteger(options.fastStoredDirectories, 500, 100000, DEFAULT_OPTIONS.fastStoredDirectories);
+  options.fastStoredFiles = clampInteger(options.fastStoredFiles, 1000, MAX_SCAN_FILES, DEFAULT_OPTIONS.fastStoredFiles);
+  options.fastStoredDirectories = clampInteger(options.fastStoredDirectories, 500, MAX_SCAN_FILES, DEFAULT_OPTIONS.fastStoredDirectories);
   options.unusedDaysThreshold = clampInteger(options.unusedDaysThreshold, 1, 3650, DEFAULT_OPTIONS.unusedDaysThreshold);
   options.frequentUseDaysThreshold = clampInteger(options.frequentUseDaysThreshold, 1, 60, DEFAULT_OPTIONS.frequentUseDaysThreshold);
   options.skipDirectories = Array.from(new Set([...(DEFAULT_OPTIONS.skipDirectories || []), ...((rawOptions && rawOptions.skipDirectories) || [])]));
@@ -1530,10 +1513,10 @@ function daysBetween(date, now) {
 function shouldSkipDirectory(name, protectedReasons, options) {
   const lowerName = name.toLowerCase();
   const skipNames = new Set(options.skipDirectories.map((item) => item.toLowerCase()));
-  if (options.includeProgramFiles && isProgramFilesName(lowerName)) {
-    return false;
+  if (!options.includeProgramFiles && isProgramFilesName(lowerName)) {
+    return true;
   }
-  return skipNames.has(lowerName) || protectedReasons.some((reason) => reason.includes("diretorio do sistema"));
+  return skipNames.has(lowerName);
 }
 
 function entryScanPriority(entry) {
@@ -1545,7 +1528,7 @@ function entryScanPriority(entry) {
     if (/^(temp|tmp|cache|caches|logs|backups|backup|old|archive|archives)$/i.test(name)) {
       return 1;
     }
-    if (/^(\.git|node_modules|appdata|programdata|windows|system32|winsxs)$/i.test(name)) {
+    if (/^(\.git|windows|system32|syswow64|winsxs|windowsapps|recovery|system volume information)$/i.test(name)) {
       return 20;
     }
     return 4;
@@ -1570,15 +1553,17 @@ function getProtectedReasons(absolutePath, relativePath, name, options = DEFAULT
     reasons.push("arquivo de configuracao/lock");
   }
 
-  if (PROTECTED_EXTENSIONS.has(extension)) {
-    reasons.push("executavel ou biblioteca do sistema");
+  if (SYSTEM_PROTECTED_EXTENSIONS.has(extension)) {
+    reasons.push("arquivo essencial do sistema");
+  } else if (PROTECTED_EXTENSIONS.has(extension) && isStrictSystemPath(lowerAbsolute, lowerRelative)) {
+    reasons.push("binario em diretorio critico do sistema");
   }
 
   const knowledge = classifyFileKnowledge(relativePath, name, extension);
   if (knowledge.isSystemEssential) {
     reasons.push("tipo essencial do sistema");
   }
-  if (knowledge.isProjectDependency) {
+  if (knowledge.isProjectDependency && PROTECTED_FILE_NAMES.has(lowerName)) {
     reasons.push("dependencia/configuracao de projeto");
   }
 
@@ -1586,19 +1571,15 @@ function getProtectedReasons(absolutePath, relativePath, name, options = DEFAULT
     reasons.push("metadados de versionamento");
   }
 
-  if (/(^|[\\/])(windows|system32|winsxs|windowsapps|programdata|recovery|system volume information|\$recycle\.bin)([\\/]|$)/i.test(absolutePath)) {
-    reasons.push("diretorio do sistema operacional");
-  }
-
-  if (/(^|\/)(windows|system32|winsxs|windowsapps|programdata|recovery|system volume information|\$recycle\.bin)(\/|$)/i.test(lowerRelative)) {
-    reasons.push("diretorio do sistema operacional");
+  if (isStrictSystemPath(lowerAbsolute, lowerRelative)) {
+    reasons.push("diretorio critico do sistema operacional");
   }
 
   if (!options.includeProgramFiles && isProgramFilesPath(lowerAbsolute, lowerRelative)) {
     reasons.push("diretorio do sistema operacional");
   }
 
-  if (lowerAbsolute.includes(`${path.sep}appdata${path.sep}`) && /\.(dll|exe|sys|dat)$/i.test(lowerAbsolute)) {
+  if (isStrictSystemPath(lowerAbsolute, lowerRelative) && /\.(dll|exe|sys|dat)$/i.test(lowerAbsolute)) {
     reasons.push("artefato sensivel de aplicacao do usuario");
   }
 
@@ -1613,6 +1594,17 @@ function isProgramFilesName(name) {
 function isProgramFilesPath(absolutePath, relativePath) {
   return /(^|[\\/])program files( \(x86\))?([\\/]|$)/i.test(absolutePath)
     || /(^|\/)program files( \(x86\))?(\/|$)/i.test(relativePath);
+}
+
+function isStrictSystemPath(absolutePath, relativePath = "") {
+  const corpus = [
+    String(absolutePath || "").replace(/\\/g, "/").toLowerCase(),
+    normalizeRelative(relativePath).toLowerCase()
+  ].join("\n");
+
+  return /(^|\/)(system32|syswow64|winsxs|windowsapps|recovery|system volume information|\$winreagent)(\/|$)/i.test(corpus)
+    || /(^|\/)windows\/(system32|syswow64|winsxs|servicing|systemresources|security|inf|assembly|diagnostics)(\/|$)/i.test(corpus)
+    || /(^|\/)programdata\/microsoft(\/|$)/i.test(corpus);
 }
 
 function isTextCandidate(lowerName, extension) {
@@ -2040,13 +2032,11 @@ function buildComponents(fileNodes, edges) {
       }
     }
 
-    const nodeIdSet = new Set(nodeIds);
-    const edgeCount = edges.filter((edge) => nodeIdSet.has(edge.source) && nodeIdSet.has(edge.target)).length;
     components.push({
       id: `component:${components.length + 1}`,
       nodeIds,
       nodeCount: nodeIds.length,
-      edgeCount,
+      edgeCount: 0,
       depth: 0,
       risk: "baixo",
       hasProtected: false,
@@ -2057,10 +2047,32 @@ function buildComponents(fileNodes, edges) {
     });
   }
 
+  if (edges.length) {
+    const componentByNodeId = new Map();
+    for (const component of components) {
+      for (const nodeId of component.nodeIds) {
+        componentByNodeId.set(nodeId, component);
+      }
+    }
+    for (const edge of edges) {
+      const sourceComponent = componentByNodeId.get(edge.source);
+      if (sourceComponent && sourceComponent === componentByNodeId.get(edge.target)) {
+        sourceComponent.edgeCount += 1;
+      }
+    }
+  }
+
   return components.sort((a, b) => b.nodeCount - a.nodeCount);
 }
 
 function detectCyclesDfs(fileNodes, edges) {
+  if (!edges.length) {
+    for (const node of fileNodes) {
+      node.dfsColor = "preto";
+    }
+    return [];
+  }
+
   const adjacency = new Map(fileNodes.map((node) => [node.id, []]));
   const color = new Map(fileNodes.map((node) => [node.id, "branco"]));
   const stack = [];
@@ -2153,6 +2165,13 @@ function applyComponentMetadata(fileNodes, components) {
 }
 
 function applyImpactMetadata(fileNodes) {
+  if (!fileNodes.some((node) => node.incomingFrom?.length)) {
+    for (const node of fileNodes) {
+      node.impactCount = 0;
+    }
+    return;
+  }
+
   const byId = new Map(fileNodes.map((node) => [node.id, node]));
 
   for (const node of fileNodes) {
@@ -2177,12 +2196,21 @@ function applyImpactMetadata(fileNodes) {
 
 function applySimulationMetadata(fileNodes) {
   const byId = new Map(fileNodes.map((node) => [node.id, node]));
+  const cycleMembersById = new Map();
+  for (const node of fileNodes) {
+    for (const cycleId of node.cycleBlockIds || []) {
+      if (!cycleMembersById.has(cycleId)) {
+        cycleMembersById.set(cycleId, []);
+      }
+      cycleMembersById.get(cycleId).push(node);
+    }
+  }
 
   for (const node of fileNodes) {
     const dependsOnNodes = node.outgoingTo.map((id) => byId.get(id)).filter(Boolean);
     const dependentNodes = node.incomingFrom.map((id) => byId.get(id)).filter(Boolean);
     const cycleMembers = node.inCycle
-      ? fileNodes.filter((candidate) => candidate.cycleBlockIds.some((id) => node.cycleBlockIds.includes(id)))
+      ? Array.from(new Set((node.cycleBlockIds || []).flatMap((id) => cycleMembersById.get(id) || [])))
       : [];
     const moveWith = new Map();
 
@@ -2216,6 +2244,10 @@ function applySimulationMetadata(fileNodes) {
 }
 
 function computeDepths(fileNodes) {
+  if (!fileNodes.some((node) => node.outgoingTo?.length)) {
+    return new Map(fileNodes.map((node) => [node.id, 0]));
+  }
+
   const byId = new Map(fileNodes.map((node) => [node.id, node]));
   const memo = new Map();
   const visiting = new Set();
@@ -2523,6 +2555,7 @@ function buildSummary(nodes, fileNodes, edges, components, cycles, skipped, warn
     storedHuman: formatBytes(storedBytes),
     inventoryProvider: inventoryStats?.provider || "node",
     inventoryTruncated: Boolean(inventoryStats?.truncated),
+    inventoryReclaimable: inventoryStats?.inventoryReclaimable || null,
     scanStrategy: scanGrouping?.strategy || "balanced_search_horizontal_dpn",
     auxiliaryDatabase: scanGrouping?.auxiliaryDatabase || null,
     heavyFolders: scanGrouping?.heavyFolders || [],

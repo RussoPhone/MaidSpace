@@ -8,7 +8,14 @@ const state = {
   hoveredNodeId: null,
   expandedGroups: new Set(),
   zoom: 1,
+  graphPan: { x: 0, y: 0 },
+  graphTransform: null,
+  isPanningGraph: false,
+  lastPanPoint: null,
   graphMode: "medium",
+  graphViewCache: new Map(),
+  graphViewCacheResult: null,
+  graphRenderFrame: 0,
   scanProgressTimer: null,
   scanProgressStartedAt: 0,
   scanProgressPercent: 0
@@ -50,23 +57,26 @@ const graphModes = {
     label: "mapa",
     view: "far",
     limit: 220,
-    nodeScale: 1.45,
+    edgeLimit: 0,
+    nodeScale: 1.28,
     labels: true
   },
   medium: {
     key: "medium",
     label: "grupos",
     view: "medium",
-    limit: 360,
-    nodeScale: 1.12,
+    limit: 720,
+    edgeLimit: 220,
+    nodeScale: 0.98,
     labels: true
   },
   close: {
     key: "close",
     label: "arquivos",
     view: "close",
-    limit: 1200,
-    nodeScale: 0.9,
+    limit: 1800,
+    edgeLimit: 520,
+    nodeScale: 0.72,
     labels: true
   }
 };
@@ -74,13 +84,7 @@ const graphModes = {
 const elements = {
   serverStatus: document.querySelector("#serverStatus"),
   rootPath: document.querySelector("#rootPath"),
-  adaptiveScan: document.querySelector("#adaptiveScan"),
-  saveState: document.querySelector("#saveState"),
-  progressiveScan: document.querySelector("#progressiveScan"),
-  includeProgramFiles: document.querySelector("#includeProgramFiles"),
-  maxFiles: document.querySelector("#maxFiles"),
-  maxDepth: document.querySelector("#maxDepth"),
-  maxFileSize: document.querySelector("#maxFileSize"),
+  targetFreeGb: document.querySelector("#targetFreeGb"),
   scanButton: document.querySelector("#scanButton"),
   scanProgress: document.querySelector("#scanProgress"),
   progressLabel: document.querySelector("#progressLabel"),
@@ -119,20 +123,14 @@ init();
 async function init() {
   bindEvents();
   renderEmpty();
-  updateAdaptiveInputs();
 
   try {
     const health = await fetchJson("/api/health");
-    elements.rootPath.value = health.cwd;
-    elements.maxFiles.value = health.defaultOptions.maxFiles;
-    elements.maxDepth.value = health.defaultOptions.maxDepth;
-    elements.maxFileSize.value = health.defaultOptions.maxFileSizeBytes;
-    elements.adaptiveScan.checked = health.defaultOptions.adaptive !== false;
-    if (elements.includeProgramFiles) {
-      elements.includeProgramFiles.checked = health.defaultOptions.includeProgramFiles === true;
+    elements.rootPath.value = health.defaultRootPath || health.cwd || "";
+    if (elements.targetFreeGb) {
+      elements.targetFreeGb.value = bytesToWholeGb(health.defaultOptions.targetFreeBytes || 0);
     }
-    updateAdaptiveInputs();
-    setStatus("pronto", "ok");
+    setStatus(isNativeMaidSpace() ? "local" : "fallback local", "ok");
   } catch (error) {
     setStatus("servidor indisponível", "error");
   }
@@ -150,16 +148,21 @@ function bindEvents() {
     renderFiles();
     renderGraph();
   });
-  elements.adaptiveScan.addEventListener("change", updateAdaptiveInputs);
   elements.graphCanvas.addEventListener("click", selectCanvasNode);
+  elements.graphCanvas.addEventListener("contextmenu", (event) => event.preventDefault());
+  elements.graphCanvas.addEventListener("mousedown", startGraphPan);
   elements.graphCanvas.addEventListener("mousemove", hoverCanvasNode);
+  window.addEventListener("mouseup", stopGraphPan);
   elements.graphCanvas.addEventListener("mouseleave", () => {
+    if (state.isPanningGraph) {
+      return;
+    }
     if (state.hoveredNodeId) {
       state.hoveredNodeId = null;
       renderGraph();
     }
   });
-  elements.graphCanvas.addEventListener("wheel", handleGraphWheel, { passive: false });
+  document.addEventListener("click", clearNodeSelectionOnOutsideClick);
   elements.modeFar?.addEventListener("click", () => setGraphMode("far"));
   elements.modeMedium?.addEventListener("click", () => setGraphMode("medium"));
   elements.modeClose?.addEventListener("click", () => setGraphMode("close"));
@@ -187,33 +190,20 @@ function bindEvents() {
 
   window.addEventListener("resize", () => {
     if (state.activeTab === "graph") {
-      renderGraph();
+      scheduleGraphRender();
     }
   });
-}
-
-function updateAdaptiveInputs() {
-  const disabled = elements.adaptiveScan.checked;
-  elements.maxFiles.disabled = disabled;
-  elements.maxDepth.disabled = disabled;
-  elements.maxFileSize.disabled = disabled;
 }
 
 function setGraphMode(modeKey) {
   const zoomByMode = {
     far: 0.62,
     medium: 1,
-    close: 2.05
+    close: 1.85
   };
   state.zoom = zoomByMode[modeKey] || 1;
-  renderGraph();
-}
-
-function handleGraphWheel(event) {
-  event.preventDefault();
-  const factor = event.deltaY < 0 ? 1.12 : 0.88;
-  state.zoom = clamp(state.zoom * factor, 0.45, 2.8);
-  renderGraph();
+  state.graphPan = { x: 0, y: 0 };
+  scheduleGraphRender();
 }
 
 async function runScan() {
@@ -224,28 +214,14 @@ async function runScan() {
     return;
   }
 
-  const options = elements.adaptiveScan.checked
-    ? { adaptive: true }
-    : {
-        adaptive: false,
-        maxFiles: Number(elements.maxFiles.value),
-        maxDepth: Number(elements.maxDepth.value),
-        maxFileSizeBytes: Number(elements.maxFileSize.value)
-      };
-  options.saveState = elements.saveState?.checked !== false;
-  options.includeProgramFiles = elements.includeProgramFiles?.checked === true;
-
-  if (elements.progressiveScan?.checked) {
-    await runProgressiveScan(rootPath, options);
-    return;
-  }
+  const options = buildDefaultScanOptions();
 
   elements.scanButton.disabled = true;
   elements.exportButton.disabled = true;
   setStatus("escaneando", "busy");
   startScanProgress();
   resetSystemLog();
-  appendSystemLog("A.D.D iniciado em modo normal.");
+  appendSystemLog(isNativeMaidSpace() ? "MaidSpace local iniciado." : "MaidSpace fallback iniciado.");
 
   try {
     state.result = await fetchJson("/api/scan", {
@@ -253,7 +229,10 @@ async function runScan() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ rootPath, options })
     });
+    resetGraphCache();
     state.selectedNodeId = null;
+    state.hoveredNodeId = null;
+    state.graphPan = { x: 0, y: 0 };
     elements.exportButton.disabled = false;
     syncOptionsFromResult();
     setStatus(`ok - ${state.result.summary.elapsedMs} ms`, "ok");
@@ -261,146 +240,39 @@ async function runScan() {
     appendSystemLog(`Varredura concluida: ${formatNumber(state.result.summary.files || 0)} arquivos e ${formatBytes(state.result.summary.totalBytes || 0)} lidos.`);
     renderAll();
   } catch (error) {
+    const message = errorMessage(error);
     setStatus("erro na varredura", "error");
     finishScanProgress("error");
-    appendSystemLog(`Erro: ${error.message}`);
-    renderError(error.message);
+    appendSystemLog(`Erro: ${message}`);
+    renderError(message);
   } finally {
     elements.scanButton.disabled = false;
   }
 }
 
-async function runProgressiveScan(rootPath, options) {
-  elements.scanButton.disabled = true;
-  elements.exportButton.disabled = true;
-  state.result = null;
-  state.selectedNodeId = null;
-  state.hoveredNodeId = null;
-  setStatus("varredura progressiva", "busy");
-  startScanProgress("progressive");
-  resetSystemLog();
-  appendSystemLog("A.D.D progressivo iniciado; aguardando primeira profundidade.");
-  renderEmpty();
-
-  try {
-    const response = await fetch("/api/scan-progressive", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rootPath, options })
-    });
-
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      throw new Error(payload.error || `Falha HTTP ${response.status}`);
-    }
-    if (!response.body) {
-      throw new Error("Navegador sem suporte a leitura progressiva.");
-    }
-
-    await readProgressiveStream(response.body);
-    if (state.result) {
-      elements.exportButton.disabled = false;
-      syncOptionsFromResult();
-      finishScanProgress("ok", state.result);
-      setStatus(`ok - ${state.result.summary.elapsedMs} ms`, "ok");
-      appendSystemLog(`Varredura progressiva concluida: ${formatNumber(state.result.summary.files || 0)} arquivos, ${formatBytes(state.result.summary.totalBytes || 0)} analisados.`);
-    }
-  } catch (error) {
-    setStatus("erro na varredura", "error");
-    finishScanProgress("error");
-    appendSystemLog(`Erro: ${error.message}`);
-    renderError(error.message);
-  } finally {
-    elements.scanButton.disabled = false;
-  }
-}
-
-async function readProgressiveStream(body) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      processProgressiveLine(line);
-    }
-  }
-
-  if (buffer.trim()) {
-    processProgressiveLine(buffer);
-  }
-}
-
-function processProgressiveLine(line) {
-  if (!line.trim()) {
-    return;
-  }
-
-  const event = JSON.parse(line);
-  if (event.type === "error") {
-    throw new Error(event.error || "Erro na varredura progressiva.");
-  }
-  if (event.type === "heartbeat") {
-    updateHeartbeatProgress(event);
-    return;
-  }
-  if (event.type !== "snapshot" || !event.result) {
-    return;
-  }
-
-  state.result = event.result;
-  updateProgressiveScanProgress(event.progress || event.result.progressive || {}, event.result);
-  appendProgressiveSnapshotLog(event.progress || event.result.progressive || {}, event.result);
-  renderAll();
-}
-
-function updateHeartbeatProgress(event) {
-  if (!elements.scanProgress) {
-    return;
-  }
-  const elapsedMs = Number(event.elapsedMs || 0);
-  const scan = event.scan || {};
-  const depthText = event.currentDepth && event.maxDepth
-    ? `ultima prof. ${event.currentDepth}/${event.maxDepth}`
-    : "preparando varredura";
-  const scanText = scan.currentPath
-    ? `${formatNumber(scan.files || 0)} arquivos vistos em ${scan.currentPath}`
-    : depthText;
-  elements.scanProgress.classList.remove("is-hidden");
-  elements.scanProgress.dataset.mode = "busy";
-  elements.progressElapsed.textContent = formatElapsed(elapsedMs);
-  elements.progressLabel.textContent = `Processando: ${scanText}`;
-  appendSystemLog(`Ainda processando (${scanText})... ${formatElapsed(elapsedMs)} sem novo snapshot.`);
-}
-
-function appendProgressiveSnapshotLog(progress, result) {
-  const summary = result?.summary || {};
-  const are = result?.relocationPlan?.spaceModes?.alto?.reallocatableHuman || "0 B";
-  appendSystemLog(`Prof. ${progress.currentDepth || "?"}/${progress.maxDepth || "?"}: ${formatNumber(summary.files || 0)} arquivos, ${formatBytes(summary.totalBytes || 0)} lidos, A.R.E alto ${are}.`);
+function buildDefaultScanOptions() {
+  return {
+    adaptive: true,
+    saveState: false,
+    includeProgramFiles: true,
+    targetFreeBytes: targetFreeBytesFromInput()
+  };
 }
 
 function syncOptionsFromResult() {
   if (!state.result?.options) {
     return;
   }
-  elements.maxFiles.value = state.result.options.maxFiles;
-  elements.maxDepth.value = state.result.options.maxDepth;
-  elements.maxFileSize.value = state.result.options.maxFileSizeBytes;
-  if (elements.includeProgramFiles) {
-    elements.includeProgramFiles.checked = state.result.options.includeProgramFiles === true;
+  if (elements.targetFreeGb) {
+    elements.targetFreeGb.value = bytesToWholeGb(state.result.options.targetFreeBytes || 0);
   }
 }
 
 async function fetchJson(url, options) {
+  if (isNativeMaidSpace()) {
+    return fetchNative(url, options);
+  }
+
   const response = await fetch(url, options);
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -409,12 +281,614 @@ async function fetchJson(url, options) {
   return payload;
 }
 
+function isNativeMaidSpace() {
+  return Boolean(window.__TAURI__?.core?.invoke);
+}
+
+async function fetchNative(url, options = {}) {
+  const invoke = window.__TAURI__.core.invoke;
+  try {
+    if (url === "/api/health") {
+      return await invoke("maidspace_health");
+    }
+    if (url === "/api/scan") {
+      const body = JSON.parse(options.body || "{}");
+      const targetFreeBytes = body.options?.targetFreeBytes || 0;
+      const scan = await invoke("analyze_maidspace", {
+        rootPath: body.rootPath,
+        targetFreeBytes
+      });
+      return nativeReportToResult(scan, body.rootPath, body.options || {});
+    }
+  } catch (error) {
+    throw asError(error);
+  }
+  throw new Error(`Rota local nao suportada: ${url}`);
+}
+
+function asError(error) {
+  return error instanceof Error ? error : new Error(errorMessage(error));
+}
+
+function errorMessage(error) {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+  if (error && typeof error === "object") {
+    if (typeof error.message === "string" && error.message.trim()) {
+      return error.message;
+    }
+    if (typeof error.error === "string" && error.error.trim()) {
+      return error.error;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+  return "Erro desconhecido no MaidSpace local.";
+}
+
+function targetFreeBytesFromInput() {
+  const gb = Number(elements.targetFreeGb?.value || 0);
+  if (!Number.isFinite(gb) || gb <= 0) {
+    return 0;
+  }
+  return Math.round(gb * 1024 * 1024 * 1024);
+}
+
+function bytesToWholeGb(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return Math.round(value / 1024 / 1024 / 1024);
+}
+
+function nativeReportToResult(scan, rootPath, options = {}) {
+  const report = scan.report || scan;
+  const files = report.files || [];
+  const nodes = files.map((file, index) => nativeFileToNode(file, index));
+  const totalBytes = Number(report.summary?.total_bytes ?? files.reduce((sum, file) => sum + Number(file.size || 0), 0));
+  const summary = {
+    scannedAt: new Date().toISOString(),
+    elapsedMs: 0,
+    directories: report.summary?.directories || 0,
+    storedDirectories: 0,
+    files: report.summary?.files || nodes.length,
+    analyzedFiles: report.summary?.analyzed_files || nodes.length,
+    storedFiles: nodes.length,
+    totalBytes,
+    totalHuman: formatBytes(totalBytes),
+    storedBytes: report.summary?.analyzed_bytes || nodes.reduce((sum, node) => sum + (node.size || 0), 0),
+    storedHuman: formatBytes(report.summary?.analyzed_bytes || nodes.reduce((sum, node) => sum + (node.size || 0), 0)),
+    inventoryProvider: "rust_local",
+    inventoryTruncated: (report.summary?.files || nodes.length) > nodes.length,
+    inventoryReclaimable: normalizeNativeInventoryReclaimable(report.summary?.inventory_reclaimable || report.summary?.inventoryReclaimable),
+    scanStrategy: "local_rust_metadata_target",
+    auxiliaryDatabase: null,
+    heavyFolders: [],
+    dependencyGroups: [],
+    dependencyGroupCount: 0,
+    targetedDfsProbes: { scheduled: 0, skipped: 0, remainingBudget: 0, parsed: 0, partialReads: 0 },
+    depthBreakdown: buildNativeDepthBreakdown(nodes),
+    entries: (report.summary?.directories || 0) + (report.summary?.files || nodes.length),
+    edges: 0,
+    components: nodes.length,
+    cycles: 0,
+    cycleNodes: 0,
+    skipped: 0,
+    warnings: 0,
+    stoppedEarly: false,
+    stopReason: null,
+    byClassification: countByField(nodes, "classification"),
+    byRisk: countByField(nodes, "risk"),
+    byDeletionDecision: countByField(nodes, "deletionDecision"),
+    byUtilityStatus: countByField(nodes, "utilityStatus"),
+    byKnowledge: {
+      systemEssential: nodes.filter((node) => node.fileKnowledge?.isSystemEssential).length,
+      projectDependency: nodes.filter((node) => node.fileKnowledge?.isProjectDependency).length,
+      userContent: nodes.filter((node) => node.fileKnowledge?.isUserContent).length,
+      lowValueGenerated: nodes.filter((node) => node.fileKnowledge?.isLowValueGenerated).length,
+      usedLast7Days: nodes.filter((node) => node.daysSinceAccess <= 7).length
+    },
+    candidateLowRisk: nodes.filter((node) => node.risk === "baixo" && node.classification === "isolado").length,
+    canDelete: nodes.filter((node) => node.deletionDecision === "pode_apagar").length,
+    probablyUseless: nodes.filter((node) => node.deletionDecision === "inutil_provavel").length,
+    mustKeep: nodes.filter((node) => node.deletionDecision === "nao_apagar").length,
+    criticalRisk: nodes.filter((node) => node.risk === "critico").length,
+    protected: nodes.filter((node) => node.classification === "critico_protegido").length,
+    unresolvedDependencies: 0,
+    recentlyAccessed: nodes.filter((node) => node.daysSinceAccess <= 4).length,
+    staleCandidates: nodes.filter((node) => node.daysSinceAccess >= 30 && node.risk === "baixo").length,
+    highImpactProviders: 0,
+    totalTransitiveImpact: 0
+  };
+  const targetFreeBytes = Number(scan.targetFreeBytes || options.targetFreeBytes || 0);
+  const relocationPlan = buildNativeRelocationPlan(nodes, summary, targetFreeBytes, report.root_path || rootPath);
+
+  return {
+    schemaVersion: 1,
+    algorithm: "MaidSpace.Local",
+    rootPath: report.root_path || rootPath,
+    options: {
+      adaptive: true,
+      scanEngine: "rust_local",
+      dependencyMode: "metadata",
+      maxFiles: report.summary?.analyzed_files || nodes.length,
+      maxDepth: 1024,
+      targetFreeBytes,
+      includeProgramFiles: true
+    },
+    scaleEstimate: { scale: "massivo", provider: "rust_local" },
+    summary,
+    nodes,
+    edges: [],
+    components: nodes.map((node, index) => ({
+      id: `component:${index + 1}`,
+      nodeIds: [node.id],
+      nodeCount: 1,
+      edgeCount: 0,
+      depth: 0,
+      risk: node.risk,
+      hasProtected: node.protectedReasons.length > 0,
+      hasCycle: false,
+      criticalRiskNodes: node.risk === "critico" ? 1 : 0,
+      highRiskNodes: node.risk === "alto" ? 1 : 0,
+      mediumRiskNodes: node.risk === "medio" ? 1 : 0
+    })),
+    cycles: [],
+    graphViews: nativeEmptyGraphViews(),
+    simulation: buildNativeSimulation(nodes),
+    skipped: [],
+    warnings: summary.inventoryTruncated
+      ? [`MaidSpace local exibiu ${nodes.length}/${summary.files} arquivos detalhados; os totais foram calculados no inventario local.`]
+      : [],
+    system: "MaidSpace",
+    modules: {
+      add: { algorithm: "A.D.D", status: "concluido", summary },
+      are: { algorithm: "A.R.E", status: "plano_gerado", summary: relocationPlan.summary },
+      alc: { algorithm: "A.L.C", status: "local_sem_estado", summary: { reanalysisNeeded: false }, statePath: null }
+    },
+    relocationPlan,
+    continuousState: { mode: "local_tauri", summary: { reanalysisNeeded: false }, changes: [] },
+    report: {
+      text: `# MaidSpace\n\nInventario local Rust: ${formatNumber(summary.files)} arquivo(s), ${summary.totalHuman}. Meta: ${formatBytes(targetFreeBytes)}.`
+    }
+  };
+}
+
+function nativeFileToNode(file, index) {
+  const relativePath = String(file.path || `file-${index}`);
+  const decision = nativeDecision(file.deletion_decision);
+  const utility = nativeUtility(file.utility_status);
+  const dependencyHint = String(file.dependency_hint || "none");
+  const protectedReasons = file.protected_reasons || [];
+  const risk = protectedReasons.length
+    ? "critico"
+    : dependencyHint === "high"
+      ? "alto"
+      : dependencyHint === "medium" || decision === "averiguar"
+        ? "medio"
+        : "baixo";
+  const extension = normalizeExtension(file.extension);
+  return {
+    id: `file:${relativePath}`,
+    kind: "file",
+    name: relativePath.split("/").pop() || relativePath,
+    relativePath,
+    extension,
+    size: Number(file.size || 0),
+    modifiedAt: null,
+    lastAccessedAt: null,
+    createdAt: null,
+    daysSinceAccess: Number(file.days_since_access || 0),
+    protectedReasons,
+    fileKnowledge: {
+      categories: [],
+      isSystemEssential: utility === "sistema",
+      isProjectDependency: dependencyHint === "high" || dependencyHint === "medium",
+      isUserContent: false,
+      isLowValueGenerated: decision === "pode_apagar" || decision === "inutil_provavel",
+      dependencyGroup: `dpn:rust:${dependencyHint}:${extension || "sem_ext"}`
+    },
+    dependencyGroup: `dpn:rust:${dependencyHint}:${extension || "sem_ext"}`,
+    incoming: 0,
+    outgoing: 0,
+    depth: 0,
+    scanDepth: filesystemDepthClient(relativePath),
+    impactCount: 0,
+    componentId: `component:${index + 1}`,
+    componentSize: 1,
+    inCycle: false,
+    cycleBlockId: null,
+    cycleBlockIds: [],
+    cycleGroupSize: 0,
+    dependsOn: [],
+    dependents: [],
+    classification: protectedReasons.length ? "critico_protegido" : "isolado",
+    risk,
+    riskScore: risk === "critico" ? 100 : risk === "alto" ? 70 : risk === "medio" ? 35 : 10,
+    riskReasons: protectedReasons,
+    impact: {
+      system: protectedReasons.length ? "protegido" : "nao_afeta_sistema",
+      user: utility === "usado_pelo_usuario" ? "alto" : "baixo",
+      dependencies: dependencyHint
+    },
+    utilityStatus: utility,
+    deletionDecision: decision,
+    relocationDecision: decision === "nao_apagar" ? "nao_mover" : "pode_mexer",
+    simulationAction: decision === "pode_apagar" ? "sugerir_lixeira_segura" : decision === "nao_apagar" ? "proteger_nao_mover" : "revisar",
+    simulation: null,
+    dependencyProbe: { enabled: false, reason: "rust_local", status: "not_needed" },
+    readError: null,
+    dependencySamples: []
+  };
+}
+
+function normalizeNativeInventoryReclaimable(value) {
+  const result = {};
+  for (const mode of ["baixo", "medio", "alto"]) {
+    const bucket = value?.[mode] || {};
+    result[mode] = {
+      bytes: Number(bucket.bytes || 0),
+      files: Number(bucket.files || 0)
+    };
+  }
+  return result;
+}
+
+function buildNativeRelocationPlan(nodes, summary, targetFreeBytes, rootPath = "") {
+  const inventoryEstimate = summary.inventoryReclaimable || normalizeNativeInventoryReclaimable(null);
+  const modes = {
+    baixo: nodes.filter((node) => node.deletionDecision === "pode_apagar"),
+    medio: nodes.filter((node) => node.deletionDecision === "pode_apagar" || node.deletionDecision === "inutil_provavel"),
+    alto: nodes.filter((node) => node.deletionDecision !== "nao_apagar")
+  };
+  const spaceModes = Object.fromEntries(["baixo", "medio", "alto"].map((mode) => {
+    const candidates = modes[mode]
+      .slice()
+      .sort((a, b) => b.size - a.size)
+      .map((node) => nativeModeCandidate(node, mode));
+    const detailedBytes = sumNodeBytes(modes[mode]);
+    const estimatedBytes = Number(inventoryEstimate[mode]?.bytes || 0);
+    const estimatedFiles = Number(inventoryEstimate[mode]?.files || 0);
+    const bytes = Math.max(detailedBytes, estimatedBytes);
+    return [mode, {
+      mode,
+      label: mode,
+      description: mode === "alto" ? "Agressivo assistido local." : mode === "medio" ? "Equilibrado local." : "Conservador local.",
+      criteria: [],
+      reallocatableBytes: bytes,
+      reallocatableHuman: formatBytes(bytes),
+      detailedReallocatableBytes: detailedBytes,
+      detailedReallocatableHuman: formatBytes(detailedBytes),
+      inventoryEstimatedBytes: estimatedBytes,
+      inventoryEstimatedHuman: formatBytes(estimatedBytes),
+      inventoryEstimatedFiles: estimatedFiles,
+      inventoryEstimateUsed: estimatedBytes > detailedBytes,
+      fileCount: Math.max(candidates.length, estimatedFiles),
+      packageCount: Math.max(candidates.length, estimatedFiles),
+      packageFileCount: Math.max(candidates.length, estimatedFiles),
+      packages: candidates.slice(0, 80).map((item, index) => ({
+        id: `native:${mode}:${index + 1}`,
+        mode,
+        bytes: item.sizeBytes,
+        human: item.sizeHuman,
+        fileCount: 1,
+        files: [item.path],
+        candidateRoots: [item.path],
+        maxRisk: item.risk,
+        classifications: [item.classification],
+        targetDirectory: item.targetDirectory,
+        justification: item.justification
+      })),
+      candidates: candidates.slice(0, 160)
+    }];
+  }));
+  const blockedFiles = nodes
+    .filter((node) => node.deletionDecision === "nao_apagar")
+    .sort((a, b) => b.size - a.size)
+    .slice(0, 240)
+    .map((node) => ({
+      path: node.relativePath,
+      sizeBytes: node.size,
+      sizeHuman: formatBytes(node.size),
+      classification: node.classification,
+      risk: node.risk,
+      deletionDecision: node.deletionDecision,
+      daysSinceAccess: node.daysSinceAccess,
+      spatialCategories: [],
+      reason: node.protectedReasons[0] || "uso recente, sistema ou dependencia",
+      blockingReasons: node.protectedReasons
+    }));
+  const targetPlan = buildNativeTargetPlan(spaceModes, targetFreeBytes);
+  return {
+    schemaVersion: 4,
+    algorithm: "A.R.E",
+    safeMode: true,
+    generatedAt: new Date().toISOString(),
+    rootPath,
+    objective: "manter espaco livre localmente sem tocar sistema ou uso constante",
+    question: "Quanto precisa liberar?",
+    summary: {
+      totalFiles: summary.files,
+      analyzedFiles: summary.analyzedFiles,
+      storedFiles: summary.storedFiles,
+      totalBytes: summary.totalBytes,
+      totalHuman: summary.totalHuman,
+      analyzedBytes: summary.storedBytes,
+      analyzedHuman: summary.storedHuman,
+      inventoryProvider: "rust_local",
+      inventoryTruncated: summary.inventoryTruncated,
+      suggestions: nodes.length,
+      keepInPlace: blockedFiles.length,
+      moveCandidates: spaceModes.alto.fileCount,
+      reviewCandidates: spaceModes.alto.fileCount,
+      safeTrashCandidates: spaceModes.baixo.fileCount,
+      blockedFiles: blockedFiles.length,
+      blockedBytes: sumNodeBytes(nodes.filter((node) => node.deletionDecision === "nao_apagar")),
+      blockedHuman: formatBytes(sumNodeBytes(nodes.filter((node) => node.deletionDecision === "nao_apagar"))),
+      reallocatable: {
+        baixo: spaceModes.baixo.reallocatableBytes,
+        medio: spaceModes.medio.reallocatableBytes,
+        alto: spaceModes.alto.reallocatableBytes
+      },
+      reallocatableHuman: {
+        baixo: spaceModes.baixo.reallocatableHuman,
+        medio: spaceModes.medio.reallocatableHuman,
+        alto: spaceModes.alto.reallocatableHuman
+      },
+      targetFreeBytes,
+      targetFreeHuman: formatBytes(targetFreeBytes),
+      targetPlan,
+      compactedLists: true,
+      cycleBlocks: 0
+    },
+    relocationSimulation: buildNativeRelocationSimulation(spaceModes, summary.totalBytes, blockedFiles),
+    depthRelocation: buildNativeDepthRelocation(nodes, spaceModes),
+    spaceModes,
+    candidatesByMode: {
+      baixo: spaceModes.baixo.candidates,
+      medio: spaceModes.medio.candidates,
+      alto: spaceModes.alto.candidates
+    },
+    blockedFiles,
+    safetyReport: {
+      riskLevel: "medio",
+      blockedBytes: sumNodeBytes(nodes.filter((node) => node.deletionDecision === "nao_apagar")),
+      blockedHuman: formatBytes(sumNodeBytes(nodes.filter((node) => node.deletionDecision === "nao_apagar"))),
+      bestCaseReallocatableBytes: spaceModes.alto.reallocatableBytes,
+      bestCaseReallocatableHuman: spaceModes.alto.reallocatableHuman,
+      text: targetPlan
+        ? `Meta ${formatBytes(targetFreeBytes)}: ${targetPlan.statusText}`
+        : `Modo alto pode realocar ${spaceModes.alto.reallocatableHuman}.`
+    },
+    proposedStructure: [],
+    groups: {},
+    operations: [],
+    cycleBlocks: [],
+    targetPlan
+  };
+}
+
+function nativeModeCandidate(node, mode) {
+  return {
+    mode,
+    path: node.relativePath,
+    sizeBytes: node.size,
+    sizeHuman: formatBytes(node.size),
+    packageBytes: node.size,
+    packageHuman: formatBytes(node.size),
+    packagePaths: [node.relativePath],
+    packageFileCount: 1,
+    targetDirectory: node.deletionDecision === "pode_apagar" ? "/lixeira_segura" : "/revisar/baixo_uso",
+    classification: node.classification,
+    risk: node.risk,
+    structuralRisk: node.risk,
+    deletionDecision: node.deletionDecision,
+    relocationDecision: node.relocationDecision,
+    daysSinceAccess: node.daysSinceAccess,
+    incoming: 0,
+    outgoing: 0,
+    dependencyImpact: node.impact.dependencies,
+    userImpact: node.impact.user,
+    systemImpact: node.impact.system,
+    spatialCategories: [],
+    justification: mode === "alto" ? "candidato local assistido para cumprir meta" : "candidato local de baixo uso",
+    requiresConfirmation: true
+  };
+}
+
+function buildNativeTargetPlan(spaceModes, targetFreeBytes) {
+  if (!targetFreeBytes) {
+    return null;
+  }
+  for (const mode of ["baixo", "medio", "alto"]) {
+    const modeData = spaceModes[mode];
+    if (modeData.reallocatableBytes < targetFreeBytes) {
+      continue;
+    }
+    let total = 0;
+    const selected = [];
+    for (const item of modeData.candidates) {
+      if (total >= targetFreeBytes) {
+        break;
+      }
+      selected.push(item);
+      total += item.packageBytes || item.sizeBytes || 0;
+    }
+    const enoughFromDetailedList = total >= targetFreeBytes;
+    const plannedBytes = enoughFromDetailedList ? total : modeData.reallocatableBytes;
+    return {
+      targetBytes: targetFreeBytes,
+      targetHuman: formatBytes(targetFreeBytes),
+      selectedMode: mode,
+      plannedBytes,
+      plannedHuman: formatBytes(plannedBytes),
+      selectedFiles: selected.length,
+      candidates: selected,
+      status: enoughFromDetailedList ? "atingivel" : "estimativa_exige_mais_detalhe",
+      statusText: enoughFromDetailedList
+        ? `usar nivel ${mode} libera aproximadamente ${formatBytes(total)} com ${selected.length} arquivo(s).`
+        : `nivel ${mode} estima ${modeData.reallocatableHuman}; a lista detalhada foi compactada e o A.L.C deve confirmar os candidatos finais.`
+    };
+  }
+  return {
+    targetBytes: targetFreeBytes,
+    targetHuman: formatBytes(targetFreeBytes),
+    selectedMode: "insuficiente",
+    plannedBytes: spaceModes.alto.reallocatableBytes,
+    plannedHuman: spaceModes.alto.reallocatableHuman,
+    selectedFiles: spaceModes.alto.candidates.length,
+    candidates: spaceModes.alto.candidates,
+    status: "insuficiente",
+    statusText: `o inventario local encontrou ${spaceModes.alto.reallocatableHuman}; abaixo da meta.`
+  };
+}
+
+function buildNativeRelocationSimulation(spaceModes, totalBytes, blockedFiles) {
+  return Object.fromEntries(["baixo", "medio", "alto"].map((mode) => {
+    const relocatedBytes = spaceModes[mode].reallocatableBytes;
+    return [mode, {
+      mode,
+      beforeBytes: totalBytes,
+      beforeHuman: formatBytes(totalBytes),
+      relocatedBytes,
+      relocatedHuman: formatBytes(relocatedBytes),
+      remainingBytes: Math.max(0, totalBytes - relocatedBytes),
+      remainingHuman: formatBytes(Math.max(0, totalBytes - relocatedBytes)),
+      relocatedPercent: totalBytes > 0 ? Math.round((relocatedBytes / totalBytes) * 1000) / 10 : 0,
+      packageCount: spaceModes[mode].packageCount,
+      candidateFiles: spaceModes[mode].fileCount,
+      blockedFiles: blockedFiles.length,
+      simulatedMoves: [],
+      explanation: `Simulacao local: ${formatBytes(relocatedBytes)} no modo ${mode}.`
+    }];
+  }));
+}
+
+function buildNativeDepthBreakdown(nodes) {
+  const groups = new Map();
+  for (const node of nodes) {
+    const depth = node.scanDepth || 0;
+    if (!groups.has(depth)) {
+      groups.set(depth, { depth, files: 0, bytes: 0, human: "0 B", canDelete: 0, probablyUseless: 0, blocked: 0, risk: { baixo: 0, medio: 0, alto: 0, critico: 0 } });
+    }
+    const group = groups.get(depth);
+    group.files += 1;
+    group.bytes += node.size || 0;
+    group.canDelete += node.deletionDecision === "pode_apagar" ? 1 : 0;
+    group.probablyUseless += node.deletionDecision === "inutil_provavel" ? 1 : 0;
+    group.blocked += node.deletionDecision === "nao_apagar" ? 1 : 0;
+    group.risk[node.risk] = (group.risk[node.risk] || 0) + 1;
+  }
+  return Array.from(groups.values()).map((group) => ({ ...group, human: formatBytes(group.bytes) }));
+}
+
+function buildNativeDepthRelocation(nodes, spaceModes) {
+  return buildNativeDepthBreakdown(nodes).map((item) => ({
+    ...item,
+    totalBytes: item.bytes,
+    totalHuman: item.human,
+    blockedBytes: 0,
+    blockedHuman: "0 B",
+    reallocatable: {
+      baixo: spaceModes.baixo.reallocatableBytes,
+      medio: spaceModes.medio.reallocatableBytes,
+      alto: spaceModes.alto.reallocatableBytes
+    },
+    reallocatableHuman: {
+      baixo: spaceModes.baixo.reallocatableHuman,
+      medio: spaceModes.medio.reallocatableHuman,
+      alto: spaceModes.alto.reallocatableHuman
+    }
+  }));
+}
+
+function buildNativeSimulation(nodes) {
+  const groups = {
+    pode_apagar: nodes.filter((node) => node.deletionDecision === "pode_apagar"),
+    inutil_provavel: nodes.filter((node) => node.deletionDecision === "inutil_provavel"),
+    averiguar: nodes.filter((node) => node.deletionDecision === "averiguar"),
+    nao_apagar: nodes.filter((node) => node.deletionDecision === "nao_apagar")
+  };
+  return {
+    buckets: {
+      isolados: nodes,
+      dicentes: [],
+      docentes: [],
+      mistos: [],
+      protegidos: groups.nao_apagar,
+      blocosInterdependentes: [],
+      revisar: groups.averiguar
+    },
+    decisionGroups: Object.fromEntries(Object.entries(groups).map(([key, items]) => [
+      key,
+      items.map((node) => ({ id: node.id, path: node.relativePath, risk: node.risk, action: node.simulationAction }))
+    ])),
+    recommendation: {}
+  };
+}
+
+function nativeDecision(value) {
+  return {
+    can_delete: "pode_apagar",
+    probably_useless: "inutil_provavel",
+    review: "averiguar",
+    do_not_delete: "nao_apagar"
+  }[value] || "averiguar";
+}
+
+function nativeUtility(value) {
+  return {
+    system: "sistema",
+    protected: "protegido",
+    used_by_user: "usado_pelo_usuario",
+    dependency_relevant: "dependencia_relevante",
+    low_use: "baixo_uso",
+    probably_useless: "inutil_provavel",
+    uncertain: "utilidade_incerta"
+  }[value] || "utilidade_incerta";
+}
+
+function normalizeExtension(extension) {
+  const value = String(extension || "").toLowerCase();
+  return value && !value.startsWith(".") ? `.${value}` : value;
+}
+
+function countByField(items, field) {
+  return items.reduce((accumulator, item) => {
+    const key = item[field] || "desconhecido";
+    accumulator[key] = (accumulator[key] || 0) + 1;
+    return accumulator;
+  }, {});
+}
+
+function sumNodeBytes(nodes) {
+  return nodes.reduce((sum, node) => sum + (node.size || 0), 0);
+}
+
+function filesystemDepthClient(relativePath) {
+  const normalized = String(relativePath || "").replace(/\\/g, "/");
+  return normalized ? normalized.split("/").filter(Boolean).length - 1 : 0;
+}
+
+function nativeEmptyGraphViews() {
+  const emptyView = { mode: "local", description: "grafo reconstruido no cliente", nodes: [], edges: [] };
+  return { far: emptyView, medium: emptyView, close: emptyView };
+}
+
 function setStatus(text, mode) {
   elements.serverStatus.textContent = text;
   elements.serverStatus.dataset.mode = mode;
 }
 
-function startScanProgress(mode = "normal") {
+function startScanProgress() {
   if (!elements.scanProgress) {
     return;
   }
@@ -423,19 +897,13 @@ function startScanProgress(mode = "normal") {
   state.scanProgressPercent = 4;
   elements.scanProgress.classList.remove("is-hidden");
   elements.scanProgress.dataset.mode = "busy";
-  elements.progressLabel.textContent = mode === "progressive"
-    ? "Iniciando varredura progressiva"
-    : "Escaneando arquivos e diretorios";
+  elements.progressLabel.textContent = "Escaneando arquivos e diretorios";
   elements.progressElapsed.textContent = "0.0s";
   elements.progressBar.style.width = "4%";
 
   if (state.scanProgressTimer) {
     window.clearInterval(state.scanProgressTimer);
     state.scanProgressTimer = null;
-  }
-
-  if (mode === "progressive") {
-    return;
   }
 
   state.scanProgressTimer = window.setInterval(updateScanProgress, 180);
@@ -551,6 +1019,21 @@ function renderAll() {
   renderNodeDetails();
 }
 
+function scheduleGraphRender() {
+  if (state.graphRenderFrame) {
+    return;
+  }
+  state.graphRenderFrame = window.requestAnimationFrame(() => {
+    state.graphRenderFrame = 0;
+    renderGraph();
+  });
+}
+
+function resetGraphCache() {
+  state.graphViewCache = new Map();
+  state.graphViewCacheResult = state.result;
+}
+
 function renderEmpty() {
   elements.metrics.innerHTML = metricMarkup([
     ["0", "entradas"],
@@ -561,6 +1044,16 @@ function renderEmpty() {
     ["0", "médio risco"],
     ["0", "baixo risco"],
     ["0", "candidatos"]
+  ]);
+  elements.metrics.innerHTML = metricMarkup([
+    ["0 B", "espaco usado"],
+    ["0 B", "A.R.E alto"],
+    ["0", "arquivos"],
+    ["0", "diretorios"],
+    ["0", "pode apagar"],
+    ["0", "inutil provavel"],
+    ["0", "nao apagar"],
+    ["0", "alto/critico"]
   ]);
   elements.filesTable.innerHTML = empty("Nenhuma varredura executada.");
   elements.dependenciesTable.innerHTML = empty("Nenhuma dependência detectada ainda.");
@@ -611,6 +1104,19 @@ function renderMetrics() {
     [summary.byRisk.alto || 0, "alto risco"],
     [summary.staleCandidates || summary.candidateLowRisk, `candidatos - ${scale}`]
   ]);
+  const highReclaimable = state.result.relocationPlan?.spaceModes?.alto?.reallocatableHuman
+    || state.result.relocationPlan?.summary?.reallocatableHuman?.alto
+    || "0 B";
+  elements.metrics.innerHTML = metricMarkup([
+    [summary.totalHuman || formatBytes(summary.totalBytes || 0), "espaco usado"],
+    [highReclaimable, `A.R.E alto - ${scale}`],
+    [summary.files, "arquivos"],
+    [summary.directories, "diretorios"],
+    [summary.canDelete || 0, "pode apagar"],
+    [summary.probablyUseless || 0, "inutil provavel"],
+    [summary.mustKeep || 0, "nao apagar"],
+    [(summary.byRisk?.critico || 0) + (summary.byRisk?.alto || 0), "alto/critico"]
+  ]);
 }
 
 function syncDepthFilterOptions() {
@@ -656,15 +1162,15 @@ function renderGraph() {
 
   const mode = resolveGraphMode();
   state.graphMode = mode.key;
-  const baseView = state.result.graphViews?.[mode.view] || fallbackGraphView();
-  const view = buildInteractiveGraphView(baseView, mode);
+  const view = getInteractiveGraphView(mode);
   const visibleNodes = selectGraphNodes(view.nodes, mode);
   const visibleIds = new Set(visibleNodes.map((node) => node.id));
-  const edges = view.edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
+  const edges = selectGraphEdges(view.edges, visibleIds, mode);
   state.currentGraphNodes = visibleNodes;
   state.currentGraphEdges = edges;
 
-  elements.graphHint.textContent = `${mode.label} - ${visibleNodes.length}/${view.nodes.length} nos - ${focusText()}`;
+  const capped = visibleNodes.length < view.nodes.length ? "mais relevantes" : "todos";
+  elements.graphHint.textContent = `${mode.label} - ${visibleNodes.length}/${view.nodes.length} nos (${capped}) - ${focusText()}`;
   updateZoomLabel(mode);
 
   if (!visibleNodes.length) {
@@ -672,13 +1178,19 @@ function renderGraph() {
     return;
   }
 
-  const layout = computeImpactLayout(visibleNodes, width, height, mode);
+  const world = graphWorldSize(width, height, visibleNodes.length, mode);
+  const layout = computeImpactLayout(visibleNodes, world.width, world.height, mode);
+  state.graphTransform = graphTransformFor(width, height, world.width, world.height);
   state.graphLayout = layout;
 
-  drawGraphBackdrop(context, width, height);
-  drawDecisionZones(context, width, height, mode);
+  context.save();
+  context.translate(state.graphTransform.offsetX, state.graphTransform.offsetY);
+  context.scale(state.graphTransform.scale, state.graphTransform.scale);
+  drawGraphBackdrop(context, world.width, world.height);
+  drawDecisionZones(context, world.width, world.height, mode);
   drawEdges(context, edges, layout);
   drawNodes(context, layout, mode);
+  context.restore();
 }
 
 function resolveGraphMode() {
@@ -695,10 +1207,79 @@ function updateZoomLabel(mode = resolveGraphMode()) {
   if (!elements.zoomLabel) {
     return;
   }
-  elements.zoomLabel.textContent = `${mode.label} - ${Math.round(state.zoom * 100)}%`;
+  const pan = state.graphPan || { x: 0, y: 0 };
+  elements.zoomLabel.textContent = `${mode.label} - ${Math.round(state.zoom * 100)}% - x:${Math.round(pan.x)} y:${Math.round(pan.y)}`;
   elements.modeFar?.classList.toggle("is-active", mode.key === "far");
   elements.modeMedium?.classList.toggle("is-active", mode.key === "medium");
   elements.modeClose?.classList.toggle("is-active", mode.key === "close");
+}
+
+function graphScale() {
+  return clamp(state.zoom, 0.42, 3.6);
+}
+
+function graphWorldSize(width, height, nodeCount, mode) {
+  const densityFactor = clamp(Math.sqrt(Math.max(1, nodeCount) / 160), 1, mode.key === "close" ? 4.2 : mode.key === "medium" ? 2.8 : 1.8);
+  return {
+    width: Math.max(width, width * densityFactor),
+    height: Math.max(height, height * densityFactor)
+  };
+}
+
+function graphTransformFor(width, height, worldWidth, worldHeight) {
+  const scale = graphScale();
+  const baseX = (width - worldWidth * scale) / 2;
+  const baseY = (height - worldHeight * scale) / 2;
+  return {
+    scale,
+    worldWidth,
+    worldHeight,
+    offsetX: baseX + (state.graphPan?.x || 0),
+    offsetY: baseY + (state.graphPan?.y || 0)
+  };
+}
+
+function baseGraphOffset(transform) {
+  return {
+    x: -((transform.worldWidth * graphScale()) - elements.graphCanvas.getBoundingClientRect().width) / 2,
+    y: -((transform.worldHeight * graphScale()) - elements.graphCanvas.getBoundingClientRect().height) / 2
+  };
+}
+
+function screenToWorld(screenX, screenY, transform = state.graphTransform) {
+  if (!transform) {
+    return { x: screenX, y: screenY };
+  }
+  return {
+    x: (screenX - transform.offsetX) / transform.scale,
+    y: (screenY - transform.offsetY) / transform.scale
+  };
+}
+
+function getInteractiveGraphView(mode) {
+  if (state.graphViewCacheResult !== state.result) {
+    resetGraphCache();
+  }
+
+  const expandedKey = Array.from(state.expandedGroups).sort().join(",");
+  const cacheKey = `${mode.key}:${expandedKey}`;
+  if (state.graphViewCache.has(cacheKey)) {
+    return state.graphViewCache.get(cacheKey);
+  }
+
+  const nativeView = state.result.graphViews?.[mode.view];
+  const hasNativeView = (nativeView?.nodes || []).length > 0;
+  const baseView = hasNativeView ? nativeView : emptyGraphView();
+  const view = buildInteractiveGraphView(baseView, mode);
+  state.graphViewCache.set(cacheKey, view);
+  return view;
+}
+
+function emptyGraphView() {
+  return {
+    nodes: [],
+    edges: state.result?.edges || []
+  };
 }
 
 function fallbackGraphView() {
@@ -715,7 +1296,10 @@ function fallbackGraphView() {
 }
 
 function buildInteractiveGraphView(baseView, mode) {
-  if (!state.result || mode.key === "far") {
+  if (!state.result) {
+    return baseView;
+  }
+  if (mode.key === "far" && (baseView.nodes || []).length) {
     return baseView;
   }
 
@@ -772,6 +1356,9 @@ function buildInteractiveGraphView(baseView, mode) {
 function groupKeyForFile(file, mode) {
   const dir = topDirectoryFromPath(file.relativePath);
   const decision = file.deletionDecision || "averiguar";
+  if (mode.key === "far") {
+    return `${decision}|${dir}`;
+  }
   if (mode.key === "close") {
     return `${decision}|${dir}|${file.extension || "sem_ext"}`;
   }
@@ -891,6 +1478,29 @@ function selectGraphNodes(nodes, mode) {
       return scoreB - scoreA || String(a.label).localeCompare(String(b.label));
     })
     .slice(0, mode.limit);
+}
+
+function selectGraphEdges(edges, visibleIds, mode) {
+  if (!mode.edgeLimit) {
+    return [];
+  }
+  const focusId = state.hoveredNodeId || state.selectedNodeId;
+  const visibleEdges = edges.filter((edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target));
+  if (focusId) {
+    const focused = visibleEdges
+      .filter((edge) => edge.source === focusId || edge.target === focusId)
+      .sort((a, b) => (b.weight || 1) - (a.weight || 1))
+      .slice(0, Math.min(mode.edgeLimit, 160));
+    const seen = new Set(focused.map((edge) => edge.id || `${edge.source}->${edge.target}`));
+    const context = visibleEdges
+      .filter((edge) => !seen.has(edge.id || `${edge.source}->${edge.target}`))
+      .sort((a, b) => (b.weight || 1) - (a.weight || 1))
+      .slice(0, Math.max(0, mode.edgeLimit - focused.length));
+    return [...focused, ...context];
+  }
+  return visibleEdges
+    .sort((a, b) => (b.weight || 1) - (a.weight || 1))
+    .slice(0, mode.edgeLimit);
 }
 
 function nodeMatchesDepth(node, depthFilter) {
@@ -1217,10 +1827,22 @@ function clearCanvas(message) {
   state.graphLayout = new Map();
   state.currentGraphNodes = [];
   state.currentGraphEdges = [];
+  state.graphTransform = null;
 }
 
 function hoverCanvasNode(event) {
   if (!state.graphLayout.size) {
+    return;
+  }
+  if (state.isPanningGraph) {
+    const current = { x: event.clientX, y: event.clientY };
+    const previous = state.lastPanPoint || current;
+    state.graphPan = {
+      x: (state.graphPan?.x || 0) + current.x - previous.x,
+      y: (state.graphPan?.y || 0) + current.y - previous.y
+    };
+    state.lastPanPoint = current;
+    scheduleGraphRender();
     return;
   }
   const point = nearestCanvasPoint(event);
@@ -1228,11 +1850,14 @@ function hoverCanvasNode(event) {
   elements.graphCanvas.style.cursor = point ? "pointer" : "grab";
   if (state.hoveredNodeId !== nextHoverId) {
     state.hoveredNodeId = nextHoverId;
-    renderGraph();
+    scheduleGraphRender();
   }
 }
 
 function selectCanvasNode(event) {
+  if (event.button === 2 || state.isPanningGraph) {
+    return;
+  }
   if (!state.graphLayout.size) {
     return;
   }
@@ -1245,7 +1870,12 @@ function selectCanvasNode(event) {
       } else {
         state.expandedGroups.add(nearest.node.id);
       }
+      resetGraphCache();
     }
+    renderNodeDetails();
+    renderGraph();
+  } else if (state.selectedNodeId) {
+    state.selectedNodeId = null;
     renderNodeDetails();
     renderGraph();
   }
@@ -1253,8 +1883,11 @@ function selectCanvasNode(event) {
 
 function nearestCanvasPoint(event) {
   const rect = elements.graphCanvas.getBoundingClientRect();
-  const x = event.clientX - rect.left;
-  const y = event.clientY - rect.top;
+  const screenX = event.clientX - rect.left;
+  const screenY = event.clientY - rect.top;
+  const world = screenToWorld(screenX, screenY);
+  const x = world.x;
+  const y = world.y;
   let nearest = null;
   let nearestDistance = Infinity;
 
@@ -1266,7 +1899,42 @@ function nearestCanvasPoint(event) {
     }
   }
 
-  return nearest && nearestDistance <= nearest.radius + 12 ? nearest : null;
+  const hitSlack = 12 / Math.max(0.4, state.graphTransform?.scale || 1);
+  return nearest && nearestDistance <= nearest.radius + hitSlack ? nearest : null;
+}
+
+function startGraphPan(event) {
+  if (event.button !== 2) {
+    return;
+  }
+  event.preventDefault();
+  state.isPanningGraph = true;
+  state.lastPanPoint = { x: event.clientX, y: event.clientY };
+  elements.graphCanvas.style.cursor = "grabbing";
+}
+
+function stopGraphPan() {
+  if (!state.isPanningGraph) {
+    return;
+  }
+  state.isPanningGraph = false;
+  state.lastPanPoint = null;
+  elements.graphCanvas.style.cursor = "grab";
+}
+
+function clearNodeSelectionOnOutsideClick(event) {
+  if (!state.selectedNodeId) {
+    return;
+  }
+  const clickedCanvas = event.target === elements.graphCanvas;
+  const clickedInspector = elements.nodeDetails?.contains(event.target);
+  const clickedTableNode = Boolean(event.target.closest?.("[data-node-id]"));
+  if (clickedCanvas || clickedInspector || clickedTableNode) {
+    return;
+  }
+  state.selectedNodeId = null;
+  renderNodeDetails();
+  renderGraph();
 }
 
 function renderNodeDetails() {
@@ -1477,7 +2145,7 @@ function renderAreSummary(plan) {
           <button class="are-summary-card" type="button" data-open-are-modal>
             <span>${escapeHtml(modeLabel(modeKey))}</span>
             <strong>${escapeHtml(mode.reallocatableHuman || "0 B")}</strong>
-            <small>${formatNumber(mode.packageCount || 0)} pacote(s) simulados</small>
+            <small>${escapeHtml(mode.inventoryEstimateUsed ? "estimativa total + candidatos" : `${formatNumber(mode.packageCount || 0)} pacote(s) simulados`)}</small>
           </button>
         `;
       }).join("")}
@@ -1493,6 +2161,7 @@ function renderAreSummary(plan) {
 function renderAreModal(plan) {
   const modes = ["baixo", "medio", "alto"];
   return `
+    ${renderTargetPlan(plan.targetPlan || plan.summary?.targetPlan)}
     ${renderAreSimulation(plan)}
     ${renderAreDepthBreakdown(plan)}
     <section class="are-modal-summary">
@@ -1503,7 +2172,7 @@ function renderAreModal(plan) {
           <article class="are-mode-total are-mode-${escapeHtml(modeKey)}">
             <span>${escapeHtml(modeLabel(modeKey))}</span>
             <strong>${escapeHtml(mode.reallocatableHuman || "0 B")}</strong>
-            <small>${formatNumber(mode.packageCount || 0)} pacote(s) / depois: ${escapeHtml(simulation.remainingHuman || "0 B")}</small>
+            <small>${escapeHtml(mode.inventoryEstimateUsed ? `inventario ${mode.inventoryEstimatedHuman || "0 B"} / detalhado ${mode.detailedReallocatableHuman || "0 B"}` : `${formatNumber(mode.packageCount || 0)} pacote(s) / depois: ${simulation.remainingHuman || "0 B"}`)}</small>
           </article>
         `;
       }).join("")}
@@ -1519,6 +2188,39 @@ function renderAreModal(plan) {
     </section>
     ${modes.map((modeKey) => renderAreMode(plan.spaceModes?.[modeKey], modeKey)).join("")}
     ${renderBlockedFiles(plan.blockedFiles || [])}
+  `;
+}
+
+function renderTargetPlan(targetPlan) {
+  if (!targetPlan) {
+    return "";
+  }
+  return `
+    <section class="are-simulation-board">
+      <div class="are-section-heading">
+        <div>
+          <h3>Meta de limpeza</h3>
+          <p class="muted">${escapeHtml(targetPlan.statusText || "Meta calculada pelo MaidSpace.")}</p>
+        </div>
+      </div>
+      <div class="are-simulation-grid">
+        <article class="are-sim-card">
+          <span>Meta</span>
+          <strong>${escapeHtml(targetPlan.targetHuman || "0 B")}</strong>
+          <small>espaco desejado</small>
+        </article>
+        <article class="are-sim-card">
+          <span>Nivel</span>
+          <strong>${escapeHtml(modeLabel(targetPlan.selectedMode || "alto"))}</strong>
+          <small>${escapeHtml(targetPlan.status || "planejado")}</small>
+        </article>
+        <article class="are-sim-card">
+          <span>Plano</span>
+          <strong>${escapeHtml(targetPlan.plannedHuman || "0 B")}</strong>
+          <small>${formatNumber(targetPlan.selectedFiles || 0)} arquivo(s)</small>
+        </article>
+      </div>
+    </section>
   `;
 }
 
@@ -1995,13 +2697,18 @@ function formatAccess(days) {
 }
 
 function formatBytes(bytes) {
-  if (bytes < 1024) {
-    return `${bytes} B`;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
   }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KB`;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
   }
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  const digits = unitIndex === 0 || value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
 function formatNumber(value) {

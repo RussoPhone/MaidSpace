@@ -1,7 +1,7 @@
 [package]
-name = "src-add"
+name = "maidspace"
 version = "0.1.0"
-description = "Interface local do S.R.C A.D.D"
+description = "Interface local do MaidSpace"
 edition = "2021"
 
 [build-dependencies]

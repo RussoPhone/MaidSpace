@@ -158,7 +158,7 @@ async function saveCurrentState(rootPath, state) {
 
 function stateFilePath(rootPath) {
   const baseDirectory = process.env.LOCALAPPDATA
-    ? path.join(process.env.LOCALAPPDATA, "SRC", "states")
+    ? path.join(process.env.LOCALAPPDATA, "MaidSpace", "states")
     : path.join(os.tmpdir(), "src-states");
   const id = crypto.createHash("sha1").update(path.resolve(rootPath || ".").toLowerCase()).digest("hex");
   return path.join(baseDirectory, `${id}.json`);

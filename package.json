@@ -1,15 +1,24 @@
 {
-  "name": "sistema-relocacao-continua",
+  "name": "maidspace",
   "version": "0.1.0",
   "private": true,
-  "description": "Sistema de Relocacao Continua com A.D.D, A.R.E e A.L.C em modo seguro.",
+  "description": "MaidSpace: utilitario local para manter espaco livre com inventario rapido e limpeza assistida.",
   "scripts": {
+    "setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-maidspace.ps1",
     "core:check": "cargo check --manifest-path src-core/add-core/Cargo.toml",
     "core:run": "cargo run --manifest-path src-core/add-core/Cargo.toml --",
-    "desktop": "node src/desktop/launcher.js",
+    "desktop": "npm run maidspace:dev",
+    "fallback": "node src/desktop/launcher.js",
+    "maidspace:dev": "npx @tauri-apps/cli dev",
+    "maidspace:build": "npx @tauri-apps/cli build",
+    "maidspace:build:local": "powershell -ExecutionPolicy Bypass -File scripts/maidspace-build.ps1",
     "start": "node server.js",
-    "tauri:dev": "npx tauri dev",
+    "tauri:dev": "npx @tauri-apps/cli dev",
+    "tauri:build": "npx @tauri-apps/cli build",
     "test": "node --test"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
   },
   "engines": {
     "node": ">=18"

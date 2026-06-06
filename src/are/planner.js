@@ -49,9 +49,9 @@ const MODE_RULES = {
   },
   alto: {
     label: "alto",
-    description: "Agressivo assistido: busca o maior ganho possivel sem tocar sistema, estruturas protegidas, ciclos ou uso recente.",
+    description: "Agressivo assistido: busca o maior ganho possivel sem tocar sistema, estruturas protegidas ou ciclos.",
     maxRisk: 3,
-    minAccessDays: 3,
+    minAccessDays: 0,
     minModifiedDays: 0,
     requireSafeProfile: false,
     packageMode: "componente"
@@ -75,7 +75,10 @@ function generateRelocationPlan(addReport, options = {}) {
   const operations = selectTopSpatialEntries(spatialEntries, operationLimit).map((entry) => planFile(entry.node, entry));
   const proposedStructure = buildProposedStructure(operations, cycles);
   const groups = groupOperations(operations);
-  const spaceModes = buildSpaceModes(spatialEntries, context.nodeByPath, { candidateLimit, packageLimit });
+  const inventoryEstimate = normalizeInventoryReclaimable(addReport.summary?.inventoryReclaimable);
+  const spaceModes = buildSpaceModes(spatialEntries, context.nodeByPath, { candidateLimit, packageLimit, inventoryEstimate });
+  const targetFreeBytes = normalizeTargetFreeBytes(options.targetFreeBytes);
+  const targetPlan = buildTargetCleanupPlan(spaceModes, targetFreeBytes);
   const blockedEntries = spatialEntries.filter((entry) => entry.modes.length === 0);
   const blockedFiles = selectTopSpatialEntries(blockedEntries, blockedLimit)
     .map(toBlockedFile);
@@ -118,11 +121,34 @@ function generateRelocationPlan(addReport, options = {}) {
         medio: spaceModes.medio.reallocatableBytes,
         alto: spaceModes.alto.reallocatableBytes
       },
+      detailedReallocatable: {
+        baixo: spaceModes.baixo.detailedReallocatableBytes,
+        medio: spaceModes.medio.detailedReallocatableBytes,
+        alto: spaceModes.alto.detailedReallocatableBytes
+      },
+      inventoryEstimatedReclaimable: {
+        baixo: spaceModes.baixo.inventoryEstimatedBytes,
+        medio: spaceModes.medio.inventoryEstimatedBytes,
+        alto: spaceModes.alto.inventoryEstimatedBytes
+      },
       reallocatableHuman: {
         baixo: spaceModes.baixo.reallocatableHuman,
         medio: spaceModes.medio.reallocatableHuman,
         alto: spaceModes.alto.reallocatableHuman
       },
+      detailedReallocatableHuman: {
+        baixo: spaceModes.baixo.detailedReallocatableHuman,
+        medio: spaceModes.medio.detailedReallocatableHuman,
+        alto: spaceModes.alto.detailedReallocatableHuman
+      },
+      inventoryEstimatedReclaimableHuman: {
+        baixo: spaceModes.baixo.inventoryEstimatedHuman,
+        medio: spaceModes.medio.inventoryEstimatedHuman,
+        alto: spaceModes.alto.inventoryEstimatedHuman
+      },
+      targetFreeBytes,
+      targetFreeHuman: formatBytes(targetFreeBytes),
+      targetPlan,
       depthRelocation,
       compactedLists: compact,
       cycleBlocks: cycles.length
@@ -140,6 +166,7 @@ function generateRelocationPlan(addReport, options = {}) {
     proposedStructure,
     groups,
     operations,
+    targetPlan,
     cycleBlocks: cycles.map((cycle) => ({
       id: cycle.id,
       type: cycle.type,
@@ -153,7 +180,8 @@ function generateRelocationPlan(addReport, options = {}) {
       "Nao move, apaga ou altera arquivos automaticamente.",
       "Modo baixo aceita apenas arquivo isolado, antigo, risco baixo e perfil espacial seguro.",
       "Modo medio aceita pacotes antigos quando o componente inteiro pode ser realocado junto.",
-      "Modo alto e agressivo, mas bloqueia sistema, protegidos, ciclos, uso recente e dependencias essenciais.",
+      "Modo alto e agressivo, mas bloqueia sistema, estruturas protegidas, ciclos e dependencias essenciais.",
+      "Em inventarios grandes, os totais podem vir da estimativa completa por metadados enquanto as listas exibem os principais candidatos detalhados.",
       "O A.R.E calcula ganho espacial; a execucao real depende de confirmacao do usuario."
     ],
     note: "Simulacao espacial: bytes realocados representam o que sairia do diretorio principal se o usuario confirmasse a realocacao indicada."
@@ -312,6 +340,9 @@ function modeEligibilityReason(mode, node, packageNodes, profile, absoluteBlockR
   if (rule.minModifiedDays > 0 && modifiedAge < rule.minModifiedDays) {
     return { allowed: false, reason: `modificacao recente no pacote (${modifiedAge} dia(s)); exige ${rule.minModifiedDays}+` };
   }
+  if (mode !== "alto" && packageNodes.some((item) => (item.unresolvedDependencies || 0) > 0)) {
+    return { allowed: false, reason: "dependencias incertas exigem modo alto" };
+  }
   if (mode === "baixo") {
     if (node.classification !== "isolado") {
       return { allowed: false, reason: "modo baixo exige classificacao isolado pelo A.D.D" };
@@ -349,10 +380,6 @@ function absoluteBlockReasonsFor(node) {
   if (impactSystem === "afeta_sistema" || impactSystem === "protegido") {
     reasons.push("arquivo de sistema ou protegido");
   }
-  if ((node.unresolvedDependencies || 0) > 0) {
-    reasons.push("dependencias nao resolvidas");
-  }
-
   return Array.from(new Set(reasons));
 }
 
@@ -374,7 +401,7 @@ function packageBlockReasonsFor(packageNodes, mode) {
     if (item.protectedReasons?.length || systemImpact === "afeta_sistema" || systemImpact === "protegido") {
       reasons.push(`pacote contem arquivo protegido: ${item.relativePath}`);
     }
-    if ((item.unresolvedDependencies || 0) > 0) {
+    if (mode !== "alto" && (item.unresolvedDependencies || 0) > 0) {
       reasons.push(`pacote contem dependencia incerta: ${item.relativePath}`);
     }
   }
@@ -392,7 +419,10 @@ function buildSpaceModes(spatialEntries, nodeByPath, options = {}) {
       .map((entry) => toModeCandidate(entry, mode))
       .sort((a, b) => b.packageBytes - a.packageBytes || a.path.localeCompare(b.path))
       .slice(0, Number.isFinite(options.candidateLimit) ? options.candidateLimit : undefined);
-    const reallocatableBytes = sumUniqueBytes(entries, nodeByPath, mode);
+    const detailedReallocatableBytes = sumUniqueBytes(entries, nodeByPath, mode);
+    const inventoryEstimatedBytes = options.inventoryEstimate?.[mode]?.bytes || 0;
+    const inventoryEstimatedFiles = options.inventoryEstimate?.[mode]?.files || 0;
+    const reallocatableBytes = Math.max(detailedReallocatableBytes, inventoryEstimatedBytes);
 
     result[mode] = {
       mode,
@@ -401,6 +431,12 @@ function buildSpaceModes(spatialEntries, nodeByPath, options = {}) {
       criteria: criteriaForMode(mode),
       reallocatableBytes,
       reallocatableHuman: formatBytes(reallocatableBytes),
+      detailedReallocatableBytes,
+      detailedReallocatableHuman: formatBytes(detailedReallocatableBytes),
+      inventoryEstimatedBytes,
+      inventoryEstimatedHuman: formatBytes(inventoryEstimatedBytes),
+      inventoryEstimatedFiles,
+      inventoryEstimateUsed: inventoryEstimatedBytes > detailedReallocatableBytes,
       fileCount: candidates.length,
       packageCount: packages.length,
       packageFileCount: packages.reduce((sum, item) => sum + item.fileCount, 0),
@@ -410,6 +446,80 @@ function buildSpaceModes(spatialEntries, nodeByPath, options = {}) {
   }
 
   return result;
+}
+
+function normalizeInventoryReclaimable(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const result = {};
+  for (const mode of MODE_ORDER) {
+    const bucket = value[mode] || {};
+    result[mode] = {
+      bytes: Number(bucket.bytes || 0),
+      files: Number(bucket.files || 0)
+    };
+  }
+  return result;
+}
+
+function normalizeTargetFreeBytes(value) {
+  const parsed = Number(value || 0);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return Math.round(parsed);
+}
+
+function buildTargetCleanupPlan(spaceModes, targetFreeBytes) {
+  if (!targetFreeBytes) {
+    return null;
+  }
+
+  for (const mode of MODE_ORDER) {
+    const modeData = spaceModes[mode];
+    if ((modeData.reallocatableBytes || 0) < targetFreeBytes) {
+      continue;
+    }
+
+    let total = 0;
+    const selected = [];
+    for (const item of modeData.candidates || []) {
+      if (total >= targetFreeBytes) {
+        break;
+      }
+      selected.push(item);
+      total += item.packageBytes || item.sizeBytes || 0;
+    }
+
+    const enoughFromDetailedList = total >= targetFreeBytes;
+    return {
+      targetBytes: targetFreeBytes,
+      targetHuman: formatBytes(targetFreeBytes),
+      selectedMode: mode,
+      plannedBytes: enoughFromDetailedList ? total : modeData.reallocatableBytes,
+      plannedHuman: formatBytes(enoughFromDetailedList ? total : modeData.reallocatableBytes),
+      selectedFiles: selected.length,
+      candidates: selected,
+      status: enoughFromDetailedList ? "atingivel" : "estimativa_exige_mais_detalhe",
+      statusText: enoughFromDetailedList
+        ? `usar modo ${mode} libera aproximadamente ${formatBytes(total)} com ${selected.length} arquivo(s).`
+        : `modo ${mode} parece suficiente pela estimativa total (${modeData.reallocatableHuman}), mas a lista detalhada foi compactada.`
+    };
+  }
+
+  const highest = spaceModes.alto;
+  return {
+    targetBytes: targetFreeBytes,
+    targetHuman: formatBytes(targetFreeBytes),
+    selectedMode: "insuficiente",
+    plannedBytes: highest.reallocatableBytes || 0,
+    plannedHuman: highest.reallocatableHuman || "0 B",
+    selectedFiles: highest.candidates?.length || 0,
+    candidates: highest.candidates || [],
+    status: "insuficiente",
+    statusText: `o inventario encontrou ${highest.reallocatableHuman || "0 B"}, abaixo da meta ${formatBytes(targetFreeBytes)}.`
+  };
 }
 
 function buildModePackages(entries, nodeByPath, mode, options = {}) {
@@ -670,8 +780,8 @@ function criteriaForMode(mode) {
   return [
     "nao e essencial ao sistema operacional",
     "nao esta em diretorio critico",
-    "nao e usado por programas ativos ou recentes",
-    "nao e dependencia de algo importante",
+    "nao possui protecao estrutural absoluta",
+    "pode conter dependencias incertas, mas somente como revisao agressiva assistida",
     "pode ser movido para armazenamento secundario, lixeira segura ou arquivo morto",
     "mesmo com dependencias, o grupo completo pode ser realocado"
   ];
@@ -888,17 +998,18 @@ function daysSince(value) {
 }
 
 function formatBytes(bytes) {
-  const value = Number(bytes || 0);
-  if (value < 1024) {
-    return `${value} B`;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
   }
-  if (value < 1024 * 1024) {
-    return `${(value / 1024).toFixed(1)} KB`;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
   }
-  if (value < 1024 * 1024 * 1024) {
-    return `${(value / 1024 / 1024).toFixed(1)} MB`;
-  }
-  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  const digits = unitIndex === 0 || value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
 module.exports = {

@@ -3,17 +3,17 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>S.R.C </title>
+    <title>MaidSpace</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <div class="app-shell">
       <header class="app-header">
         <div class="brand">
-          <span class="brand-mark">SRC</span>
+          <span class="brand-mark">MS</span>
           <div>
-            <h1>S.R.C</h1>
-            <p>A.D.D.</p>
+            <h1>MaidSpace</h1>
+            <p>limpeza local assistida</p>
           </div>
         </div>
         <div class="header-actions">
@@ -32,45 +32,13 @@
             <span>Diretorio raiz</span>
             <input id="rootPath" type="text" spellcheck="false" placeholder="C:\Users\seu-usuario\projeto">
           </label>
-          <label class="inline-check">
-            <input id="adaptiveScan" type="checkbox" checked>
-            <b>Leitura adaptavel</b>
-          </label>
-          <label class="inline-check">
-            <input id="saveState" type="checkbox">
-            <b>Salvar estado A.L.C</b>
-          </label>
-          <label class="inline-check experimental-check">
-            <input id="progressiveScan" type="checkbox" checked>
-            <b>Varredura progressiva</b>
-          </label>
-          <label class="inline-check">
-            <input id="includeProgramFiles" type="checkbox">
-            <b>Incluir Program Files</b>
-          </label>
-          <div class="compact-grid">
-            <label class="field">
-              <span>Arquivos</span>
-              <input id="maxFiles" type="number" min="100" max="1000000" step="1000" value="1000000">
-            </label>
-            <label class="field">
-              <span>Prof.</span>
-              <input id="maxDepth" type="number" min="1" max="128" step="1" value="64">
-            </label>
-          </div>
           <label class="field">
-            <span>Leitura por arquivo</span>
-            <select id="maxFileSize">
-              <option value="131072">128 KB</option>
-              <option value="262144">256 KB</option>
-              <option value="524288" selected>512 KB</option>
-              <option value="1048576">1 MB</option>
-              <option value="5242880">5 MB</option>
-            </select>
+            <span>Meta livre (GB)</span>
+            <input id="targetFreeGb" type="number" min="0" max="10000" step="1" value="0">
           </label>
-          <button id="scanButton" class="primary-button" type="button" title="Executar S.R.C">
+          <button id="scanButton" class="primary-button" type="button" title="Executar MaidSpace">
             <span aria-hidden="true">▶</span>
-            Escanear S.R.C
+            Escanear MaidSpace
           </button>
           <div id="scanProgress" class="scan-progress is-hidden" data-mode="idle" aria-live="polite">
             <div class="progress-row">
@@ -135,7 +103,7 @@
             <span><b class="dot dot-medium"></b>medio</span>
             <span><b class="dot dot-high"></b>alto</span>
             <span><b class="dot dot-critical"></b>critico</span>
-            <span>passe o mouse para revelar nomes e conexoes</span>
+            <span>clique para detalhes, botoes para visao, botao direito para mover</span>
           </div>
         </section>
 

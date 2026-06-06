@@ -1,17 +1,16 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "S.R.C A.D.D",
+  "productName": "MaidSpace",
   "version": "0.1.0",
-  "identifier": "com.russophone.src.add",
+  "identifier": "com.maidspace.desktop",
   "build": {
-    "beforeDevCommand": "npm start",
-    "devUrl": "http://127.0.0.1:4173",
     "frontendDist": "../public"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
-        "title": "S.R.C A.D.D",
+        "title": "MaidSpace",
         "width": 1320,
         "height": 860,
         "minWidth": 960,
@@ -25,6 +24,8 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": [
+      "icons/icon.ico"
+    ]
   }
 }

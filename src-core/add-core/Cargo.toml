@@ -2,7 +2,7 @@
 name = "add-core"
 version = "0.1.0"
 edition = "2021"
-description = "Motor Rust do Algoritmo Determinacao Dependencia do S.R.C."
+description = "Motor Rust de inventario e limpeza do MaidSpace."
 
 [dependencies]
 anyhow = "1"

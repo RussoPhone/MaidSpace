@@ -18,8 +18,8 @@ pub struct AnalyzeOptions {
 impl Default for AnalyzeOptions {
     fn default() -> Self {
         Self {
-            max_files: 15_000,
-            max_depth: 18,
+            max_files: 120_000,
+            max_depth: 1024,
             unused_days_threshold: 30,
             frequent_use_days_threshold: 4,
         }
@@ -37,11 +37,35 @@ pub struct AddReport {
 #[derive(Debug, Serialize)]
 pub struct Summary {
     pub files: usize,
+    pub analyzed_files: usize,
     pub directories: usize,
+    pub total_bytes: u64,
+    pub analyzed_bytes: u64,
+    pub inventory_reclaimable: InventoryReclaimable,
     pub can_delete: usize,
     pub probably_useless: usize,
     pub must_keep: usize,
     pub review: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct InventoryReclaimable {
+    pub baixo: ReclaimableBucket,
+    pub medio: ReclaimableBucket,
+    pub alto: ReclaimableBucket,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReclaimableBucket {
+    pub bytes: u64,
+    pub files: usize,
+}
+
+impl ReclaimableBucket {
+    fn add(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.files += 1;
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +121,9 @@ pub fn analyze_directory(root: &Path, options: AnalyzeOptions) -> anyhow::Result
     }
 
     let mut directories = 0usize;
+    let mut total_files = 0usize;
+    let mut total_bytes = 0u64;
+    let mut inventory_reclaimable = InventoryReclaimable::default();
     let mut file_paths = Vec::new();
 
     for entry in WalkDir::new(&root)
@@ -115,9 +142,39 @@ pub fn analyze_directory(root: &Path, options: AnalyzeOptions) -> anyhow::Result
         }
 
         if entry.file_type().is_file() {
-            file_paths.push(entry.path().to_path_buf());
-            if file_paths.len() >= options.max_files {
-                break;
+            total_files += 1;
+            if let Ok(metadata) = entry.metadata() {
+                let bytes = metadata.len();
+                total_bytes = total_bytes.saturating_add(bytes);
+                let relative = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let extension = entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let days_since_access = metadata
+                    .accessed()
+                    .ok()
+                    .map(days_since)
+                    .unwrap_or(options.unused_days_threshold + 1);
+                add_inventory_estimate(
+                    &mut inventory_reclaimable,
+                    entry.path(),
+                    &relative,
+                    &extension,
+                    bytes,
+                    days_since_access,
+                    &options,
+                );
+            }
+            if file_paths.len() < options.max_files {
+                file_paths.push(entry.path().to_path_buf());
             }
         }
     }
@@ -129,8 +186,12 @@ pub fn analyze_directory(root: &Path, options: AnalyzeOptions) -> anyhow::Result
         .collect();
 
     let summary = Summary {
-        files: files.len(),
+        files: total_files,
+        analyzed_files: files.len(),
         directories: directories.saturating_sub(1),
+        total_bytes,
+        analyzed_bytes: files.iter().map(|file| file.size).sum(),
+        inventory_reclaimable,
         can_delete: files
             .iter()
             .filter(|file| file.deletion_decision == DeletionDecision::CanDelete)
@@ -201,22 +262,103 @@ fn analyze_file(
     })
 }
 
+fn add_inventory_estimate(
+    inventory: &mut InventoryReclaimable,
+    path: &Path,
+    relative: &str,
+    extension: &str,
+    bytes: u64,
+    days_since_access: u64,
+    options: &AnalyzeOptions,
+) {
+    if bytes == 0 || is_strict_system_file(path, relative, extension) {
+        return;
+    }
+
+    let low_value = is_low_value_path(relative, extension);
+    let bulky_user_file = is_bulky_user_file(relative, extension);
+    let stale = days_since_access >= options.unused_days_threshold;
+    let not_hot = days_since_access > options.frequent_use_days_threshold;
+
+    if low_value && stale {
+        inventory.baixo.add(bytes);
+    }
+
+    if not_hot && (low_value || bulky_user_file || stale) && !protected_file_name(path) {
+        inventory.medio.add(bytes);
+    }
+
+    inventory.alto.add(bytes);
+}
+
+fn is_strict_system_file(path: &Path, relative: &str, extension: &str) -> bool {
+    let absolute = path.to_string_lossy().to_ascii_lowercase();
+    let relative = relative.to_ascii_lowercase();
+    matches!(extension, "sys" | "reg") || is_strict_system_path(&absolute, &relative)
+}
+
+fn is_low_value_path(relative: &str, extension: &str) -> bool {
+    let normalized = relative.replace('\\', "/").to_ascii_lowercase();
+    matches!(extension, "tmp" | "temp" | "log" | "bak" | "old" | "cache")
+        || normalized.contains("/cache/")
+        || normalized.contains("/caches/")
+        || normalized.contains("/tmp/")
+        || normalized.contains("/temp/")
+        || normalized.contains("/logs/")
+        || normalized.contains("/node_modules/.cache/")
+        || normalized.contains("/target/")
+        || normalized.contains("/dist/")
+        || normalized.contains("/build/")
+        || normalized.contains("/coverage/")
+}
+
+fn is_bulky_user_file(relative: &str, extension: &str) -> bool {
+    let normalized = relative.replace('\\', "/").to_ascii_lowercase();
+    matches!(
+        extension,
+        "zip"
+            | "7z"
+            | "rar"
+            | "tar"
+            | "gz"
+            | "xz"
+            | "iso"
+            | "dmg"
+            | "msi"
+            | "mp4"
+            | "mov"
+            | "mkv"
+            | "avi"
+            | "webm"
+            | "mp3"
+            | "wav"
+            | "flac"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "webp"
+    ) || normalized.contains("/downloads/")
+        || normalized.contains("/desktop/")
+        || normalized.contains("/videos/")
+        || normalized.contains("/pictures/")
+        || normalized.contains("/music/")
+        || normalized.contains("/backup/")
+        || normalized.contains("/backups/")
+        || normalized.contains("/archives/")
+}
+
 fn should_enter(entry: &DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
     !matches!(
         name.as_str(),
-        ".git"
-            | "node_modules"
-            | "target"
-            | "dist"
-            | "build"
-            | ".next"
-            | "windows"
+        "$winreagent"
+            | "$windows.~bt"
+            | "$windows.~ws"
+            | "recovery"
             | "system32"
+            | "syswow64"
             | "winsxs"
-            | "program files"
-            | "program files (x86)"
-            | "programdata"
+            | "windowsapps"
             | "system volume information"
     )
 }
@@ -320,36 +462,58 @@ fn protected_reasons(path: &Path, relative: &str) -> Vec<String> {
         reasons.push("arquivo de configuracao/lock".to_string());
     }
 
-    if matches!(
-        path.extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str(),
-        "exe" | "dll" | "sys" | "msi" | "bat" | "cmd" | "ps1" | "so" | "dylib"
-    ) {
-        reasons.push("executavel ou biblioteca".to_string());
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if matches!(extension.as_str(), "sys" | "reg") {
+        reasons.push("arquivo essencial do sistema".to_string());
+    } else if matches!(
+        extension.as_str(),
+        "exe" | "dll" | "msi" | "bat" | "cmd" | "ps1" | "so" | "dylib"
+    ) && is_strict_system_path(&absolute, &relative)
+    {
+        reasons.push("binario em diretorio critico do sistema".to_string());
     }
 
-    for token in [
-        "windows",
-        "system32",
-        "winsxs",
-        "windowsapps",
-        "program files",
-        "program files (x86)",
-        "programdata",
-        "system volume information",
-    ] {
-        if absolute.contains(token) || relative.contains(token) {
-            reasons.push("diretorio do sistema".to_string());
-            break;
-        }
+    if is_strict_system_path(&absolute, &relative) {
+        reasons.push("diretorio critico do sistema".to_string());
     }
 
     reasons.sort();
     reasons.dedup();
     reasons
+}
+
+fn is_strict_system_path(absolute: &str, relative: &str) -> bool {
+    let normalized_absolute = absolute.replace('\\', "/");
+    let normalized_relative = relative.replace('\\', "/");
+    let corpus = format!("{normalized_absolute}\n{normalized_relative}");
+
+    [
+        "/system32/",
+        "/syswow64/",
+        "/winsxs/",
+        "/windowsapps/",
+        "/recovery/",
+        "/system volume information/",
+        "/$winreagent/",
+        "/windows/system32/",
+        "/windows/syswow64/",
+        "/windows/winsxs/",
+        "/windows/",
+        "/windows/servicing/",
+        "/windows/systemresources/",
+        "/windows/security/",
+        "/windows/inf/",
+        "/windows/assembly/",
+        "/windows/diagnostics/",
+        "/programdata/microsoft/",
+    ]
+    .iter()
+    .any(|token| corpus.contains(token))
 }
 
 fn protected_file_name(path: &Path) -> bool {
@@ -384,4 +548,52 @@ fn days_since(time: SystemTime) -> u64 {
         .unwrap_or(Duration::ZERO)
         .as_secs()
         / 86_400
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn inventory_estimate_counts_program_files_but_not_windows() {
+        let root = std::env::temp_dir().join(format!(
+            "maidspace-rust-estimate-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("Program Files (x86)").join("Steam")).unwrap();
+        fs::create_dir_all(root.join("Windows").join("Fonts")).unwrap();
+        fs::create_dir_all(root.join("Users").join("demo").join("Videos")).unwrap();
+
+        create_sized_file(&root.join("Program Files (x86)").join("Steam").join("game.dat"), 20 * 1024 * 1024);
+        create_sized_file(&root.join("Windows").join("Fonts").join("system.dat"), 30 * 1024 * 1024);
+        create_sized_file(&root.join("Users").join("demo").join("Videos").join("clip.mp4"), 10 * 1024 * 1024);
+
+        let report = analyze_directory(
+            &root,
+            AnalyzeOptions {
+                max_files: 1,
+                max_depth: 16,
+                unused_days_threshold: 30,
+                frequent_use_days_threshold: 4,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.summary.total_bytes, 60 * 1024 * 1024);
+        assert!(report.summary.analyzed_bytes < report.summary.total_bytes);
+        assert_eq!(report.summary.inventory_reclaimable.alto.bytes, 30 * 1024 * 1024);
+        assert_eq!(report.summary.inventory_reclaimable.alto.files, 2);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn create_sized_file(path: &Path, bytes: u64) {
+        let file = File::create(path).unwrap();
+        file.set_len(bytes).unwrap();
+    }
 }

@@ -27,6 +27,7 @@ function createAppServer() {
         return sendJson(response, 200, {
           ok: true,
           cwd: rootDirectory,
+          defaultRootPath: defaultRootPath(),
           defaultOptions: DEFAULT_OPTIONS
         });
       }
@@ -75,8 +76,11 @@ async function buildSrcResult(addReport, options = {}, { saveState = false, stre
     candidateLimit: options.areCandidateLimit,
     packageLimit: options.arePackageLimit,
     blockedLimit: options.areBlockedLimit,
-    operationLimit: options.areOperationLimit
-  } : {});
+    operationLimit: options.areOperationLimit,
+    targetFreeBytes: options.targetFreeBytes
+  } : {
+    targetFreeBytes: options.targetFreeBytes
+  });
   const shouldBuildContinuousState = !isPartial && (!isTurboInventory || saveState || options.compareState === true);
   const currentState = shouldBuildContinuousState ? buildDirectoryState(addReport) : null;
   const previousState = shouldBuildContinuousState ? await loadPreviousState(addReport.rootPath) : null;
@@ -101,7 +105,7 @@ async function buildSrcResult(addReport, options = {}, { saveState = false, stre
 
   return {
     ...addReport,
-    system: "S.R.C",
+    system: "MaidSpace",
     modules: {
       add: {
         algorithm: "A.D.D",
@@ -203,8 +207,21 @@ async function writeNdjson(response, payload) {
 }
 
 function compactStreamResult(result, options = {}) {
-  const nodeLimit = clampNumber(options.streamNodeLimit, 120, 2500, 350);
-  const edgeLimit = clampNumber(options.streamEdgeLimit, 200, 6000, 900);
+  const shouldCompactFinal = result.progressive?.isFinal
+    && options.compactFinal !== false
+    && (
+      options.compactFinal === true
+      || result.progressive?.turbo
+      || (result.summary?.files || 0) > 50000
+      || (result.nodes || []).length > 50000
+    );
+
+  if (result.progressive?.isFinal && !shouldCompactFinal) {
+    return result;
+  }
+
+  const nodeLimit = clampNumber(options.streamNodeLimit, 120, 200000, 15000);
+  const edgeLimit = clampNumber(options.streamEdgeLimit, 200, 500000, 50000);
   const compactNodes = selectCompactNodes(result.nodes || [], result.progressive, nodeLimit);
   const compactNodeIds = new Set(compactNodes.map((node) => node.id));
   const compactEdges = (result.edges || [])
@@ -343,7 +360,7 @@ function startServer({ port = readPort(), host = "127.0.0.1" } = {}) {
       const address = server.address();
       const resolvedPort = typeof address === "object" ? address.port : port;
       const url = `http://${host}:${resolvedPort}`;
-      console.log(`S.R.C A.D.D rodando em ${url}`);
+      console.log(`MaidSpace fallback rodando em ${url}`);
       resolve({ server, url, port: resolvedPort, host });
     });
   });
@@ -362,6 +379,13 @@ function readPort() {
     return Number(process.argv[portArgIndex + 1]);
   }
   return Number(process.env.PORT || 4173);
+}
+
+function defaultRootPath() {
+  if (process.platform === "win32") {
+    return `${process.env.SystemDrive || "C:"}\\`;
+  }
+  return "/";
 }
 
 async function serveStatic(request, response) {
