@@ -75,7 +75,19 @@ select {
   font-weight: 900;
   height: 42px;
   justify-content: center;
+  position: relative;
   width: 52px;
+}
+
+.brand-mark::after {
+  border: 2px solid currentColor;
+  border-top: 0;
+  content: "";
+  height: 14px;
+  margin-left: -10px;
+  margin-top: 12px;
+  position: absolute;
+  width: 18px;
 }
 
 h1,
@@ -301,6 +313,32 @@ button:disabled {
   font-size: 11px;
   line-height: 1.35;
   padding-top: 5px;
+}
+
+.maid-alert {
+  align-items: center;
+  background: #fff8e8;
+  border-left: 4px solid var(--medium);
+  color: #3d3321;
+  display: flex;
+  gap: 8px;
+  min-height: 38px;
+  padding: 8px 10px;
+}
+
+.maid-alert.is-hidden {
+  display: none;
+}
+
+.maid-alert strong {
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.maid-alert span {
+  font-size: 12px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
 }
 
 @keyframes progress-glow {
@@ -1185,6 +1223,37 @@ summary {
   display: grid;
   gap: 6px;
   padding: 10px 12px;
+}
+
+.alc-progress {
+  background: #f7fafb;
+  border: 1px solid var(--line-strong);
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.alc-progress.is-hidden {
+  display: none;
+}
+
+.alc-progress-head {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.alc-progress-head strong {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.alc-current-file {
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .alc-result.is-hidden {

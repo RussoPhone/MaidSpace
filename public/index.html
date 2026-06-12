@@ -10,14 +10,14 @@
     <div class="app-shell">
       <header class="app-header">
         <div class="brand">
-          <span class="brand-mark">MS</span>
+          <span class="brand-mark">M</span>
           <div>
             <h1>MaidSpace</h1>
-            <p>limpeza local assistida</p>
+            <p>maid local</p>
           </div>
         </div>
         <div class="header-actions">
-          <span id="serverStatus" class="status-pill">conectando</span>
+          <span id="serverStatus" class="status-pill">...</span>
           <button id="exportButton" class="ghost-button" type="button" disabled title="Exportar relatorio JSON">
             <span aria-hidden="true">⇩</span>
             JSON
@@ -27,25 +27,35 @@
 
       <aside class="control-rail" aria-label="Controle de varredura">
         <section class="rail-section">
-          <h2>Varredura</h2>
+          <h2>Maid</h2>
           <label class="field">
-            <span>Diretorio raiz</span>
+            <span>Raiz</span>
             <div class="input-action-row">
               <input id="rootPath" type="text" spellcheck="false" placeholder="C:\Users\seu-usuario\projeto">
-              <button id="chooseRootButton" class="ghost-button" type="button" title="Escolher diretorio pelo explorador">Escolher</button>
+              <button id="chooseRootButton" class="ghost-button" type="button" title="Escolher">...</button>
             </div>
           </label>
-          <label class="field">
-            <span>Meta livre (GB)</span>
-            <input id="targetFreeGb" type="number" min="0" max="10000" step="1" value="0">
-          </label>
+          <div class="compact-grid">
+            <label class="field">
+              <span>Minimo</span>
+              <input id="minimumFreeGb" type="number" min="0" max="10000" step="1" value="0">
+            </label>
+            <label class="field">
+              <span>Limpar</span>
+              <input id="targetFreeGb" type="number" min="0" max="10000" step="1" value="0">
+            </label>
+          </div>
+          <div id="spaceAlert" class="maid-alert is-hidden" aria-live="polite">
+            <strong>Alerta</strong>
+            <span id="spaceAlertText">0 B</span>
+          </div>
           <button id="scanButton" class="primary-button" type="button" title="Executar MaidSpace">
             <span aria-hidden="true">▶</span>
-            Escanear MaidSpace
+            Varrer
           </button>
           <div id="scanProgress" class="scan-progress is-hidden" data-mode="idle" aria-live="polite">
             <div class="progress-row">
-              <span id="progressLabel">Aguardando varredura</span>
+              <span id="progressLabel">Pronto</span>
               <span id="progressElapsed">0.0s</span>
             </div>
             <div class="progress-track" aria-label="Progresso da varredura">
@@ -53,7 +63,7 @@
             </div>
           </div>
           <div id="systemLog" class="system-log" aria-live="polite">
-            <strong>Log do sistema</strong>
+            <strong>Diario</strong>
             <ol id="systemLogList"></ol>
           </div>
         </section>
@@ -66,7 +76,7 @@
             <button id="modeClose" class="mode-button" type="button">Arquivos</button>
           </div>
           <label class="field">
-            <span>Filtro de risco</span>
+            <span>Risco</span>
             <select id="graphFilter" title="Filtrar nos do grafo">
               <option value="all">Todos</option>
               <option value="critico">Critico</option>
@@ -82,10 +92,9 @@
             </select>
           </label>
           <label class="field">
-            <span>Buscar arquivo</span>
+            <span>Buscar</span>
             <input id="fileSearch" class="search-input" type="search" placeholder="nome ou caminho">
           </label>
-          <p class="microcopy">Clique no grafo para detalhes.</p>
         </section>
       </aside>
 
@@ -96,7 +105,7 @@
           <div class="stage-toolbar">
             <div>
               <h2> A.D.D</h2>
-              <p id="graphHint">Execute uma varredura.</p>
+              <p id="graphHint">Varrer.</p>
             </div>
             <span id="zoomLabel" class="zoom-label">medio - 100%</span>
           </div>
@@ -106,7 +115,6 @@
             <span><b class="dot dot-medium"></b>medio</span>
             <span><b class="dot dot-high"></b>alto</span>
             <span><b class="dot dot-critical"></b>critico</span>
-            <span>clique para detalhes, botoes para visao, scroll para zoom, botao direito para mover</span>
           </div>
         </section>
 
@@ -114,7 +122,6 @@
           <div class="dock-heading">
             <div>
               <h2>Riscos</h2>
-              <p>O que precisa da sua atenção.</p>
             </div>
           </div>
           <div id="simulationGrid" class="decision-grid"></div>
@@ -123,10 +130,9 @@
         <section class="data-dock relocation-dock" aria-label="Painel de Relocação">
           <div class="dock-heading">
             <div>
-              <h2>Painel de Relocação</h2>
-              <p>Meta, níveis A.R.E, fila A.L.C e decisões do usuário.</p>
+              <h2>Relocar</h2>
             </div>
-            <button id="openAreModal" class="ghost-button" type="button" disabled>Abrir Painel</button>
+            <button id="openAreModal" class="ghost-button" type="button" disabled>Abrir</button>
           </div>
           <div id="areSummary" class="plan-summary"></div>
           <details>
@@ -145,8 +151,7 @@
         <section class="data-dock" aria-label="Dados da varredura">
           <div class="dock-heading">
             <div>
-              <h2>Arquivos classificados</h2>
-              <p>Use quando quiser investigar.</p>
+              <h2>Arquivos</h2>
             </div>
           </div>
           <details>
@@ -173,8 +178,8 @@
       </main>
 
       <aside id="nodeDetails" class="inspector-panel" aria-label="Inspector do no">
-        <h2>No selecionado</h2>
-        <p class="muted">Clique em um no do grafo ou em uma linha da tabela.</p>
+        <h2>Item</h2>
+        <p class="muted">Selecione.</p>
       </aside>
     </div>
 
@@ -183,10 +188,9 @@
       <section class="modal-panel are-modal-panel relocation-modal-panel">
         <header class="modal-header">
           <div>
-            <h2 id="areModalTitle">Painel de Relocação</h2>
-            <p>A.R.E calcula. A.L.C move só com confirmação.</p>
+            <h2 id="areModalTitle">Relocar</h2>
           </div>
-          <button id="closeAreModal" class="ghost-button" type="button">Fechar</button>
+          <button id="closeAreModal" class="ghost-button" type="button">X</button>
         </header>
         <div id="areModalBody" class="modal-body"></div>
       </section>

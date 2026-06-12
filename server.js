@@ -36,8 +36,18 @@ function createAppServer() {
           ok: true,
           cwd: rootDirectory,
           defaultRootPath: defaultRootPath(),
-          defaultOptions: DEFAULT_OPTIONS
+          defaultOptions: {
+            ...DEFAULT_OPTIONS,
+            minimumFreeBytes: 0
+          },
+          diskStatus: await diskStatusForPath(defaultRootPath())
         });
+      }
+
+      if (request.method === "GET" && request.url.startsWith("/api/disk")) {
+        const url = new URL(request.url, `http://${request.headers.host}`);
+        const rootPath = url.searchParams.get("rootPath") || defaultRootPath();
+        return sendJson(response, 200, await diskStatusForPath(rootPath));
       }
 
       if (request.method === "POST" && request.url === "/api/scan") {
@@ -82,7 +92,8 @@ function createAppServer() {
         const body = await readJsonBody(request);
         const preferences = await saveTargetPreference(
           body.rootPath || defaultRootPath(),
-          body.targetFreeBytes
+          body.targetFreeBytes,
+          body.minimumFreeBytes
         );
         return sendJson(response, 200, preferences);
       }
@@ -137,6 +148,8 @@ async function buildSrcResult(addReport, options = {}, { saveState = false, stre
   const preferences = await loadRootPreferences(addReport.rootPath);
   applyPreferencesToAddReport(addReport, preferences);
   const targetFreeBytes = Number(options.targetFreeBytes || preferences.targetFreeBytes || 0);
+  const minimumFreeBytes = Number(options.minimumFreeBytes || preferences.minimumFreeBytes || 0);
+  const diskStatus = await diskStatusForPath(addReport.rootPath);
   const relocationPlan = generateRelocationPlan(addReport, streamMode ? {
     compact: true,
     candidateLimit: options.areCandidateLimit,
@@ -171,7 +184,14 @@ async function buildSrcResult(addReport, options = {}, { saveState = false, stre
 
   return {
     ...addReport,
+    diskStatus,
     system: "MaidSpace",
+    options: {
+      ...(addReport.options || {}),
+      ...options,
+      targetFreeBytes,
+      minimumFreeBytes
+    },
     modules: {
       add: {
         algorithm: "A.D.D",
@@ -453,6 +473,48 @@ function defaultRootPath() {
     return `${process.env.SystemDrive || "C:"}\\`;
   }
   return "/";
+}
+
+async function diskStatusForPath(rootPath) {
+  const resolved = path.resolve(rootPath || defaultRootPath());
+  try {
+    const stats = await fs.statfs(resolved);
+    const freeBytes = Number(stats.bavail || stats.bfree || 0) * Number(stats.bsize || 0);
+    const totalBytes = Number(stats.blocks || 0) * Number(stats.bsize || 0);
+    return {
+      available: true,
+      rootPath: resolved,
+      freeBytes,
+      totalBytes,
+      freeHuman: formatBytesServer(freeBytes),
+      totalHuman: formatBytesServer(totalBytes),
+      checkedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    return {
+      available: false,
+      rootPath: resolved,
+      freeBytes: 0,
+      totalBytes: 0,
+      error: error.message || String(error),
+      checkedAt: new Date().toISOString()
+    };
+  }
+}
+
+function formatBytesServer(bytes) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
+  }
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const digits = unitIndex === 0 || value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
 async function serveStatic(request, response) {

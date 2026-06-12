@@ -50,11 +50,13 @@ async function saveExemptDirectories(rootPath, directories = []) {
   return cloneRootPreferences(root);
 }
 
-async function saveTargetPreference(rootPath, targetFreeBytes) {
+async function saveTargetPreference(rootPath, targetFreeBytes, minimumFreeBytes = 0) {
   const store = await readStore();
   const root = ensureRoot(store, rootPath);
   const bytes = Number(targetFreeBytes || 0);
+  const minimum = Number(minimumFreeBytes || 0);
   root.targetFreeBytes = Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes) : 0;
+  root.minimumFreeBytes = Number.isFinite(minimum) && minimum > 0 ? Math.round(minimum) : 0;
   root.updatedAt = new Date().toISOString();
   await writeStore(store);
   return cloneRootPreferences(root);
@@ -116,7 +118,8 @@ function applyPreferencesToAddReport(addReport, preferences = {}) {
   addReport.userPreferences = {
     fileDecisions: Object.keys(fileDecisions).length,
     exemptDirectories: exemptDirectories.length,
-    targetFreeBytes: Number(preferences.targetFreeBytes || 0)
+    targetFreeBytes: Number(preferences.targetFreeBytes || 0),
+    minimumFreeBytes: Number(preferences.minimumFreeBytes || 0)
   };
   refreshSummary(addReport);
   return addReport;
@@ -167,6 +170,7 @@ function cloneRootPreferences(root = {}) {
     fileDecisions: { ...(root.fileDecisions || {}) },
     exemptDirectories: { ...(root.exemptDirectories || {}) },
     targetFreeBytes: Number(root.targetFreeBytes || 0),
+    minimumFreeBytes: Number(root.minimumFreeBytes || 0),
     updatedAt: root.updatedAt || null
   };
 }
@@ -178,6 +182,7 @@ function ensureRoot(store, rootPath) {
       fileDecisions: {},
       exemptDirectories: {},
       targetFreeBytes: 0,
+      minimumFreeBytes: 0,
       updatedAt: new Date().toISOString()
     };
   }

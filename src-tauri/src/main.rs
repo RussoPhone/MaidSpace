@@ -4,10 +4,14 @@ use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter};
+
+static ALC_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +51,8 @@ struct AlcRelocationReport {
     moved_files: usize,
     failed_files: usize,
     skipped_files: usize,
+    cancelled_files: usize,
+    cancelled: bool,
     moved_bytes: u64,
     operations: Vec<AlcOperationReport>,
 }
@@ -106,25 +112,45 @@ fn maidspace_health() -> Value {
             "maxFiles": 120000,
             "maxDepth": 1024,
             "targetFreeBytes": 0u64,
+            "minimumFreeBytes": 0u64,
             "includeProgramFiles": true
-        }
+        },
+        "diskStatus": disk_status_value(&default_root_path()).unwrap_or_else(|error| json!({
+            "available": false,
+            "error": error
+        }))
     })
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn analyze_maidspace(root_path: String, target_free_bytes: Option<u64>) -> Result<Value, String> {
+fn maidspace_disk(root_path: String) -> Result<Value, String> {
+    disk_status_value(&root_path)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn analyze_maidspace(
+    root_path: String,
+    target_free_bytes: Option<u64>,
+    minimum_free_bytes: Option<u64>,
+) -> Result<Value, String> {
     let report = analyze_directory(&PathBuf::from(root_path), AnalyzeOptions::default())
         .map_err(|error| error.to_string())?;
+    let disk_status = disk_status_value(&report.root_path).unwrap_or_else(|error| json!({
+        "available": false,
+        "error": error
+    }));
     Ok(json!({
         "mode": "local_tauri",
         "targetFreeBytes": target_free_bytes.unwrap_or(0),
+        "minimumFreeBytes": minimum_free_bytes.unwrap_or(0),
+        "diskStatus": disk_status,
         "report": report
     }))
 }
 
 #[tauri::command(rename_all = "camelCase")]
 fn analyze_add(root_path: String) -> Result<Value, String> {
-    analyze_maidspace(root_path, None)
+    analyze_maidspace(root_path, None, None)
 }
 
 #[tauri::command]
@@ -212,11 +238,13 @@ fn save_exempt_directories(root_path: String, directories: Vec<String>) -> Resul
 fn save_target_preference(
     root_path: String,
     target_free_bytes: Option<u64>,
+    minimum_free_bytes: Option<u64>,
 ) -> Result<Value, String> {
     let mut store = read_preferences_store()?;
     let root_key = preference_root_key(&root_path);
     ensure_preference_root(&mut store, &root_key);
     store["roots"][&root_key]["targetFreeBytes"] = json!(target_free_bytes.unwrap_or(0));
+    store["roots"][&root_key]["minimumFreeBytes"] = json!(minimum_free_bytes.unwrap_or(0));
     store["roots"][&root_key]["updatedAt"] = json!(now_iso_like());
     write_preferences_store(&store)?;
     Ok(root_preferences_from_store(&store, &root_path))
@@ -412,7 +440,11 @@ fn expand_alc_candidates(request: AlcExpandRequest) -> Result<AlcExpandReport, S
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn execute_alc_relocation(request: AlcRelocationRequest) -> Result<AlcRelocationReport, String> {
+fn execute_alc_relocation(
+    app: AppHandle,
+    request: AlcRelocationRequest,
+) -> Result<AlcRelocationReport, String> {
+    ALC_CANCELLED.store(false, Ordering::Relaxed);
     let root = fs::canonicalize(&request.root_path)
         .map_err(|error| format!("Nao foi possivel acessar a raiz: {error}"))?;
     if !root.is_dir() {
@@ -463,12 +495,42 @@ fn execute_alc_relocation(request: AlcRelocationRequest) -> Result<AlcRelocation
         moved_files: 0,
         failed_files: 0,
         skipped_files: 0,
+        cancelled_files: 0,
+        cancelled: false,
         moved_bytes: 0,
         operations: Vec::with_capacity(files.len().min(MAX_OPERATION_REPORTS)),
     };
     let mut seen = HashSet::new();
+    let total_preview_files = files.len();
+    let progress_target_bytes = if target_bytes > 0 {
+        target_bytes
+    } else {
+        requested_preview_bytes
+    };
+    emit_alc_progress(
+        &app,
+        "start",
+        None,
+        0,
+        total_preview_files,
+        &report,
+        progress_target_bytes,
+    );
 
-    for file in files {
+    for (index, file) in files.into_iter().enumerate() {
+        if ALC_CANCELLED.load(Ordering::Relaxed) {
+            report.cancelled = true;
+            break;
+        }
+        emit_alc_progress(
+            &app,
+            "move",
+            Some(&file.relative_path),
+            index + 1,
+            total_preview_files,
+            &report,
+            progress_target_bytes,
+        );
         relocate_alc_file(
             &root,
             &target_kind,
@@ -477,10 +539,20 @@ fn execute_alc_relocation(request: AlcRelocationRequest) -> Result<AlcRelocation
             &mut report,
             &mut seen,
         );
+        emit_alc_progress(
+            &app,
+            "moved",
+            report.operations.last().map(|operation| operation.relative_path.as_str()),
+            index + 1,
+            total_preview_files,
+            &report,
+            progress_target_bytes,
+        );
     }
 
-    if should_expand_plan && target_bytes > 0 && report.moved_bytes < target_bytes {
+    if !report.cancelled && should_expand_plan && target_bytes > 0 && report.moved_bytes < target_bytes {
         stream_relocate_alc_plan(
+            &app,
             &root,
             &request.root_path,
             &target_kind,
@@ -492,7 +564,23 @@ fn execute_alc_relocation(request: AlcRelocationRequest) -> Result<AlcRelocation
         )?;
     }
 
+    report.cancelled = report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed);
+    emit_alc_progress(
+        &app,
+        if report.cancelled { "cancelled" } else { "done" },
+        None,
+        report.requested_files,
+        report.requested_files,
+        &report,
+        progress_target_bytes,
+    );
     Ok(report)
+}
+
+#[tauri::command]
+fn cancel_alc_relocation() -> Result<(), String> {
+    ALC_CANCELLED.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -557,6 +645,15 @@ fn relocate_alc_file(
         user_content: file.user_content.unwrap_or(false),
         error: None,
     };
+
+    if ALC_CANCELLED.load(Ordering::Relaxed) {
+        operation.status = String::from("cancelled");
+        operation.error = Some(String::from("Cancelado."));
+        report.cancelled = true;
+        report.cancelled_files += 1;
+        push_operation_report(report, operation);
+        return;
+    }
 
     let relative = match safe_relative_path(&file.relative_path) {
         Ok(path) => path,
@@ -639,9 +736,16 @@ fn relocate_alc_file(
             report.moved_bytes = report.moved_bytes.saturating_add(operation.size_bytes);
         }
         Err(error) => {
-            operation.status = String::from("failed");
-            operation.error = Some(error);
-            report.failed_files += 1;
+            if ALC_CANCELLED.load(Ordering::Relaxed) || error == "Cancelado." {
+                operation.status = String::from("cancelled");
+                operation.error = Some(String::from("Cancelado."));
+                report.cancelled = true;
+                report.cancelled_files += 1;
+            } else {
+                operation.status = String::from("failed");
+                operation.error = Some(error);
+                report.failed_files += 1;
+            }
         }
     }
 
@@ -649,6 +753,7 @@ fn relocate_alc_file(
 }
 
 fn stream_relocate_alc_plan(
+    app: &AppHandle,
     root: &Path,
     root_path: &str,
     target_kind: &str,
@@ -661,8 +766,21 @@ fn stream_relocate_alc_plan(
     let preferences = root_preferences_from_store(&read_preferences_store()?, root_path);
     let mode = normalize_alc_mode(plan_mode);
     let mut stack = VecDeque::from([root.to_path_buf()]);
+    emit_alc_progress(
+        app,
+        "expand",
+        None,
+        report.requested_files,
+        report.requested_files,
+        report,
+        target_bytes,
+    );
 
     while let Some(directory) = stack.pop_back() {
+        if ALC_CANCELLED.load(Ordering::Relaxed) {
+            report.cancelled = true;
+            break;
+        }
         if report.moved_bytes >= target_bytes {
             break;
         }
@@ -673,6 +791,10 @@ fn stream_relocate_alc_plan(
 
         for entry in entries.flatten() {
             if report.moved_bytes >= target_bytes {
+                break;
+            }
+            if ALC_CANCELLED.load(Ordering::Relaxed) {
+                report.cancelled = true;
                 break;
             }
             let file_type = match entry.file_type() {
@@ -754,6 +876,15 @@ fn stream_relocate_alc_plan(
                 report,
                 seen,
             );
+            emit_alc_progress(
+                app,
+                "move",
+                report.operations.last().map(|operation| operation.relative_path.as_str()),
+                report.requested_files,
+                report.requested_files,
+                report,
+                target_bytes,
+            );
         }
     }
 
@@ -764,6 +895,47 @@ fn push_operation_report(report: &mut AlcRelocationReport, operation: AlcOperati
     if report.operations.len() < MAX_OPERATION_REPORTS {
         report.operations.push(operation);
     }
+}
+
+fn emit_alc_progress(
+    app: &AppHandle,
+    phase: &str,
+    current_file: Option<&str>,
+    index: usize,
+    total: usize,
+    report: &AlcRelocationReport,
+    target_bytes: u64,
+) {
+    let byte_percent = if target_bytes > 0 {
+        (report.moved_bytes as f64 / target_bytes as f64) * 100.0
+    } else {
+        0.0
+    };
+    let file_percent = if total > 0 {
+        (index as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    let percent = byte_percent.max(file_percent).clamp(0.0, 100.0);
+    let _ = app.emit(
+        "alc-progress",
+        json!({
+            "phase": phase,
+            "currentFile": current_file.unwrap_or(""),
+            "index": index,
+            "total": total,
+            "percent": percent,
+            "movedFiles": report.moved_files,
+            "failedFiles": report.failed_files,
+            "skippedFiles": report.skipped_files,
+            "cancelledFiles": report.cancelled_files,
+            "movedBytes": report.moved_bytes,
+            "movedHuman": format_bytes(report.moved_bytes),
+            "targetBytes": target_bytes,
+            "targetHuman": format_bytes(target_bytes),
+            "cancelled": report.cancelled || ALC_CANCELLED.load(Ordering::Relaxed)
+        }),
+    );
 }
 
 fn normalize_alc_mode(raw: &str) -> String {
@@ -1103,6 +1275,91 @@ fn default_root_path() -> String {
     }
 }
 
+fn disk_status_value(root_path: &str) -> Result<Value, String> {
+    let path = PathBuf::from(root_path);
+    let resolved = fs::canonicalize(&path).unwrap_or(path);
+    let (free_bytes, total_bytes) = if cfg!(target_os = "windows") {
+        windows_disk_bytes(&resolved)?
+    } else {
+        unix_disk_bytes(&resolved)?
+    };
+    Ok(json!({
+        "available": true,
+        "rootPath": resolved.display().to_string(),
+        "freeBytes": free_bytes,
+        "totalBytes": total_bytes,
+        "freeHuman": format_bytes(free_bytes),
+        "totalHuman": format_bytes(total_bytes),
+        "checkedAt": now_iso_like()
+    }))
+}
+
+fn windows_disk_bytes(path: &Path) -> Result<(u64, u64), String> {
+    let drive = path
+        .components()
+        .find_map(|component| match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                    Some((letter as char).to_ascii_uppercase().to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .ok_or_else(|| String::from("Drive nao encontrado."))?;
+    let script = format!(
+        "$d=Get-PSDrive -Name '{}'; [Console]::WriteLine([string]$d.Free + ',' + [string]($d.Free + $d.Used))",
+        drive
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .output()
+        .map_err(|error| format!("Disco indisponivel: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from("Disco indisponivel."));
+    }
+    parse_disk_pair(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn unix_disk_bytes(path: &Path) -> Result<(u64, u64), String> {
+    let output = Command::new("df")
+        .arg("-Pk")
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Disco indisponivel: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from("Disco indisponivel."));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .nth(1)
+        .ok_or_else(|| String::from("Disco indisponivel."))?;
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 4 {
+        return Err(String::from("Disco indisponivel."));
+    }
+    let total = parts[1].parse::<u64>().map_err(|_| String::from("Disco invalido."))? * 1024;
+    let free = parts[3].parse::<u64>().map_err(|_| String::from("Disco invalido."))? * 1024;
+    Ok((free, total))
+}
+
+fn parse_disk_pair(text: &str) -> Result<(u64, u64), String> {
+    let line = text.trim();
+    let mut parts = line.split(',').map(str::trim);
+    let free = parts
+        .next()
+        .ok_or_else(|| String::from("Disco invalido."))?
+        .parse::<u64>()
+        .map_err(|_| String::from("Disco invalido."))?;
+    let total = parts
+        .next()
+        .ok_or_else(|| String::from("Disco invalido."))?
+        .parse::<u64>()
+        .map_err(|_| String::from("Disco invalido."))?;
+    Ok((free, total))
+}
+
 fn safe_relative_path(raw: &str) -> Result<PathBuf, String> {
     let path = Path::new(raw);
     if path.is_absolute() {
@@ -1151,10 +1408,14 @@ fn move_file_to(source: &Path, destination: &Path) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
+    if ALC_CANCELLED.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelado."));
+    }
+
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
         Err(rename_error) => {
-            fs::copy(source, destination).map_err(|copy_error| {
+            copy_file_cancellable(source, destination).map_err(|copy_error| {
                 io::Error::new(
                     copy_error.kind(),
                     format!("rename: {rename_error}; copy: {copy_error}"),
@@ -1169,6 +1430,29 @@ fn move_file_to(source: &Path, destination: &Path) -> io::Result<()> {
             Ok(())
         }
     }
+}
+
+fn copy_file_cancellable(source: &Path, destination: &Path) -> io::Result<u64> {
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::File::create(destination)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut written = 0u64;
+
+    loop {
+        if ALC_CANCELLED.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(destination);
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelado."));
+        }
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        written = written.saturating_add(read as u64);
+    }
+
+    output.sync_all()?;
+    Ok(written)
 }
 
 fn read_preferences_store() -> Result<Value, String> {
@@ -1218,6 +1502,7 @@ fn root_preferences_from_store(store: &Value, root_path: &str) -> Value {
                 "fileDecisions": {},
                 "exemptDirectories": {},
                 "targetFreeBytes": 0u64,
+                "minimumFreeBytes": 0u64,
                 "updatedAt": null
             })
         })
@@ -1235,6 +1520,7 @@ fn ensure_preference_root(store: &mut Value, root_key: &str) {
             "fileDecisions": {},
             "exemptDirectories": {},
             "targetFreeBytes": 0u64,
+            "minimumFreeBytes": 0u64,
             "updatedAt": now_iso_like()
         });
     }
@@ -1267,6 +1553,7 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             maidspace_health,
+            maidspace_disk,
             analyze_maidspace,
             analyze_add,
             pick_directory,
@@ -1276,6 +1563,7 @@ fn main() {
             save_target_preference,
             expand_alc_candidates,
             execute_alc_relocation,
+            cancel_alc_relocation,
             reveal_in_explorer
         ])
         .run(tauri::generate_context!())
